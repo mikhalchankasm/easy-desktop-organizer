@@ -26,6 +26,9 @@ public static class DesktopHost
     [DllImport("user32.dll", EntryPoint = "SetWindowLongPtrW", SetLastError = true)]
     private static extern IntPtr SetWindowLongPtr(IntPtr h, int index, IntPtr value);
 
+    [DllImport("user32.dll")]
+    private static extern bool IsWindow(IntPtr h);
+
     private delegate bool EnumProc(IntPtr h, IntPtr l);
 
     private const int GWLP_HWNDPARENT = -8;
@@ -35,10 +38,12 @@ public static class DesktopHost
     /// <summary>
     /// Окно, содержащее SHELLDLL_DefView (иконки рабочего стола):
     /// классически Progman, на новых сборках Windows 11 — один из WorkerW.
+    /// Кэш сбрасывается, если окно стало невалидным (например, перезапуск Explorer).
     /// </summary>
     public static IntPtr FindDesktopHost()
     {
-        if (_host != IntPtr.Zero) return _host;
+        if (_host != IntPtr.Zero && IsWindow(_host)) return _host;
+        _host = IntPtr.Zero;
 
         var progman = FindWindow("Progman", null);
         if (progman != IntPtr.Zero &&
@@ -71,7 +76,14 @@ public static class DesktopHost
             Logger.Log("DesktopHost: окно рабочего стола не найдено");
             return false;
         }
-        SetWindowLongPtr(hwnd, GWLP_HWNDPARENT, host);
+        Marshal.SetLastSystemError(0);
+        var prev = SetWindowLongPtr(hwnd, GWLP_HWNDPARENT, host);
+        var err = Marshal.GetLastWin32Error();
+        if (prev == IntPtr.Zero && err != 0)
+        {
+            Logger.Log($"DesktopHost: SetWindowLongPtr(HWNDPARENT) не удался err={err}");
+            return false;
+        }
         return true;
     }
 }

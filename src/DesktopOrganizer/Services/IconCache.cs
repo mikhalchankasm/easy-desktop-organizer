@@ -84,9 +84,9 @@ public static class IconCache
             var hIcon = shfi.hIcon;
             if (large)
             {
-                var iid = typeof(IImageList).GUID;
-                if (SHGetImageList(SHIL_EXTRALARGE, ref iid, out var list) != 0 || list == null) return null;
-                list.GetIcon(shfi.iIcon, ILD_TRANSPARENT, out hIcon);
+                var list = GetExtraLargeList();
+                if (list == null) return null;
+                list.GetIcon(shfi.iIcon, ILD_TRANSPARENT, out hIcon); // создаёт копию → ниже DestroyIcon
             }
             if (hIcon == IntPtr.Zero) return null;
 
@@ -107,6 +107,18 @@ public static class IconCache
             Logger.Error("IconCache", ex);
             return null;
         }
+    }
+
+    // Системный список иконок 48px — общий для процесса, получаем один раз и кэшируем
+    // (иначе на каждый крупный значок создавалась бы новая COM-обёртка).
+    private static IImageList? _extraLargeList;
+
+    private static IImageList? GetExtraLargeList()
+    {
+        if (_extraLargeList != null) return _extraLargeList;
+        var iid = typeof(IImageList).GUID;
+        if (SHGetImageList(SHIL_EXTRALARGE, ref iid, out var list) != 0 || list == null) return null;
+        return _extraLargeList = list;
     }
 
     private static bool HasCustomFolderIcon(string path)

@@ -107,6 +107,35 @@ public partial class BoxWindow : Window
     [DllImport("user32.dll")]
     private static extern bool GetWindowRect(IntPtr hwnd, out RECT rect);
 
+    [StructLayout(LayoutKind.Sequential)]
+    private struct MONITORINFO
+    {
+        public int cbSize;
+        public RECT rcMonitor;
+        public RECT rcWork;
+        public uint dwFlags;
+    }
+
+    [DllImport("user32.dll")]
+    private static extern IntPtr MonitorFromWindow(IntPtr hwnd, uint flags);
+
+    [DllImport("user32.dll")]
+    private static extern bool GetMonitorInfo(IntPtr hMonitor, ref MONITORINFO mi);
+
+    private const uint MONITOR_DEFAULTTONEAREST = 2;
+
+    /// <summary>Рабочая область монитора под окном в ФИЗИЧЕСКИХ пикселях (корректно при mixed-DPI).</summary>
+    private bool TryGetWorkAreaPhysical(out RECT work)
+    {
+        work = default;
+        var mon = MonitorFromWindow(_hwnd, MONITOR_DEFAULTTONEAREST);
+        if (mon == IntPtr.Zero) return false;
+        var mi = new MONITORINFO { cbSize = Marshal.SizeOf<MONITORINFO>() };
+        if (!GetMonitorInfo(mon, ref mi)) return false;
+        work = mi.rcWork;
+        return true;
+    }
+
     private void OnSourceInitialized(object? sender, EventArgs e)
     {
         var source = (HwndSource)PresentationSource.FromVisual(this)!;
@@ -143,10 +172,8 @@ public partial class BoxWindow : Window
             SnapToNeighbors(ref r, out var guideX, out var guideY);
             Marshal.StructureToPtr(r, lParam, false);
 
-            var dpi = VisualTreeHelper.GetDpi(this);
-            OwnerApp.Overlay.ShowGuides(
-                guideX.HasValue ? guideX.Value / dpi.DpiScaleX : null,
-                guideY.HasValue ? guideY.Value / dpi.DpiScaleY : null);
+            // Координаты направляющих — физические пиксели; оверлей переведёт по своему DPI.
+            OwnerApp.Overlay.ShowGuidesPhysical(guideX, guideY);
 
             handled = true;
             return new IntPtr(1);
@@ -158,10 +185,8 @@ public partial class BoxWindow : Window
             SnapResize(ref r, wParam.ToInt32(), out var guideX, out var guideY);
             Marshal.StructureToPtr(r, lParam, false);
 
-            var dpi = VisualTreeHelper.GetDpi(this);
-            OwnerApp.Overlay.ShowGuides(
-                guideX.HasValue ? guideX.Value / dpi.DpiScaleX : null,
-                guideY.HasValue ? guideY.Value / dpi.DpiScaleY : null);
+            // Координаты направляющих — физические пиксели; оверлей переведёт по своему DPI.
+            OwnerApp.Overlay.ShowGuidesPhysical(guideX, guideY);
 
             handled = true;
             return new IntPtr(1);
@@ -173,8 +198,8 @@ public partial class BoxWindow : Window
         return IntPtr.Zero;
     }
 
-    /// <summary>Грани всех соседних коробок и рабочей области в физических пикселях.</summary>
-    private (List<int> Xs, List<int> Ys) CollectSnapTargets(DpiScale dpi)
+    /// <summary>Грани всех соседних коробок и рабочей области монитора в физических пикселях.</summary>
+    private (List<int> Xs, List<int> Ys) CollectSnapTargets()
     {
         var xs = new List<int>();
         var ys = new List<int>();
@@ -187,11 +212,13 @@ public partial class BoxWindow : Window
             ys.Add(o.T);
             ys.Add(o.B);
         }
-        var wa = SystemParameters.WorkArea;
-        xs.Add((int)Math.Round(wa.Left * dpi.DpiScaleX));
-        xs.Add((int)Math.Round(wa.Right * dpi.DpiScaleX));
-        ys.Add((int)Math.Round(wa.Top * dpi.DpiScaleY));
-        ys.Add((int)Math.Round(wa.Bottom * dpi.DpiScaleY));
+        if (TryGetWorkAreaPhysical(out var wa))
+        {
+            xs.Add(wa.L);
+            xs.Add(wa.R);
+            ys.Add(wa.T);
+            ys.Add(wa.B);
+        }
         return (xs, ys);
     }
 
@@ -205,7 +232,7 @@ public partial class BoxWindow : Window
         var threshold = (int)Math.Round(8 * dpi.DpiScaleX);
         var minW = (int)Math.Round(MinWidth * dpi.DpiScaleX);
         var minH = (int)Math.Round(MinHeight * dpi.DpiScaleY);
-        var (xs, ys) = CollectSnapTargets(dpi);
+        var (xs, ys) = CollectSnapTargets();
 
         var movesLeft = edge is WMSZ_LEFT or WMSZ_TOPLEFT or WMSZ_BOTTOMLEFT;
         var movesRight = edge is WMSZ_RIGHT or WMSZ_TOPRIGHT or WMSZ_BOTTOMRIGHT;
@@ -308,16 +335,14 @@ public partial class BoxWindow : Window
             ConsiderY(o.B - r.B, o.B);
         }
 
-        // Края рабочей области экрана.
-        var wa = SystemParameters.WorkArea;
-        var waL = (int)Math.Round(wa.Left * dpi.DpiScaleX);
-        var waT = (int)Math.Round(wa.Top * dpi.DpiScaleY);
-        var waR = (int)Math.Round(wa.Right * dpi.DpiScaleX);
-        var waB = (int)Math.Round(wa.Bottom * dpi.DpiScaleY);
-        ConsiderX(waL - r.L, waL);
-        ConsiderX(waR - r.R, waR);
-        ConsiderY(waT - r.T, waT);
-        ConsiderY(waB - r.B, waB);
+        // Края рабочей области монитора (в физических пикселях — корректно при mixed-DPI).
+        if (TryGetWorkAreaPhysical(out var wa))
+        {
+            ConsiderX(wa.L - r.L, wa.L);
+            ConsiderX(wa.R - r.R, wa.R);
+            ConsiderY(wa.T - r.T, wa.T);
+            ConsiderY(wa.B - r.B, wa.B);
+        }
 
         if (dx != null) { r.L += dx.Value; r.R = r.L + width; }
         if (dy != null) { r.T += dy.Value; r.B = r.T + height; }
@@ -526,11 +551,12 @@ public partial class BoxWindow : Window
         {
             if (!existing.HiddenByApp && DesktopIconService.IsOnDesktop(path))
             {
-                switch (DesktopIconService.Hide(path))
+                switch (DesktopIconService.Hide(path, out var added))
                 {
                     case HideResult.Hidden:
                         existing.HiddenByApp = true;
-                        App.Db.SetItemHiddenFlag(existing.Id, true);
+                        existing.AddedAttributes = added;
+                        App.Db.SetItemHidden(existing.Id, true, added);
                         DesktopIconService.RefreshDesktop();
                         break;
                     case HideResult.AccessDenied:
@@ -549,10 +575,11 @@ public partial class BoxWindow : Window
         var publicDenied = false;
         if (DesktopIconService.IsOnDesktop(path))
         {
-            switch (DesktopIconService.Hide(path))
+            switch (DesktopIconService.Hide(path, out var added))
             {
                 case HideResult.Hidden:
                     item.HiddenByApp = true;
+                    item.AddedAttributes = added;
                     DesktopIconService.RefreshDesktop();
                     break;
                 case HideResult.AccessDenied:
@@ -641,12 +668,23 @@ public partial class BoxWindow : Window
         }
     }
 
+    /// <summary>
+    /// Убирает элемент из коробки. Если ярлык был скрыт нами — сначала возвращаем его на стол;
+    /// при неудаче элемент НЕ удаляется из БД, чтобы не потерять путь из recovery-списка.
+    /// </summary>
     private void RemoveItemFromBox(BoxItem item)
     {
         if (item.HiddenByApp)
         {
-            DesktopIconService.Restore(item.FullPath);
+            var res = DesktopIconService.Restore(item.FullPath, item.AddedAttributes);
             DesktopIconService.RefreshDesktop();
+            if (res == RestoreResult.Failed)
+            {
+                MessageBox.Show(
+                    $"Не удалось вернуть ярлык на рабочий стол:\n{item.FullPath}\n\nЭлемент оставлен в коробке.",
+                    "Desktop Organizer", MessageBoxButton.OK, MessageBoxImage.Warning);
+                return;
+            }
         }
         App.Db.DeleteItem(item.Id);
         Items.Remove(item);
@@ -654,15 +692,28 @@ public partial class BoxWindow : Window
 
     private void DeleteItemFile(BoxItem item)
     {
+        var isReparse = DesktopIconService.IsReparsePoint(item.FullPath);
+
         // Удаление файла с диска — только с явным подтверждением (разделы 6.2, 18.11 ТЗ).
-        var answer = MessageBox.Show(
-            $"Удалить в корзину?\n\n{item.FullPath}",
-            "Подтверждение удаления", MessageBoxButton.YesNo, MessageBoxImage.Warning, MessageBoxResult.No);
+        var prompt = isReparse
+            ? $"Это символьная ссылка / junction. Будет удалена только сама ссылка (цель не затрагивается):\n\n{item.FullPath}"
+            : $"Удалить в корзину?\n\n{item.FullPath}";
+        var answer = MessageBox.Show(prompt, "Подтверждение удаления",
+            MessageBoxButton.YesNo, MessageBoxImage.Warning, MessageBoxResult.No);
         if (answer != MessageBoxResult.Yes) return;
 
         try
         {
-            if (Directory.Exists(item.FullPath))
+            // Снимаем наши атрибуты, чтобы в корзине/после удаления не осталось «скрытого+системного».
+            if (item.HiddenByApp) DesktopIconService.Restore(item.FullPath, item.AddedAttributes);
+
+            if (isReparse)
+            {
+                // Reparse-точку удаляем как ссылку, не рекурсивно — иначе можно задеть цель.
+                if (Directory.Exists(item.FullPath)) Directory.Delete(item.FullPath, recursive: false);
+                else if (File.Exists(item.FullPath)) File.Delete(item.FullPath);
+            }
+            else if (Directory.Exists(item.FullPath))
                 Microsoft.VisualBasic.FileIO.FileSystem.DeleteDirectory(item.FullPath,
                     Microsoft.VisualBasic.FileIO.UIOption.OnlyErrorDialogs,
                     Microsoft.VisualBasic.FileIO.RecycleOption.SendToRecycleBin);
@@ -670,8 +721,12 @@ public partial class BoxWindow : Window
                 Microsoft.VisualBasic.FileIO.FileSystem.DeleteFile(item.FullPath,
                     Microsoft.VisualBasic.FileIO.UIOption.OnlyErrorDialogs,
                     Microsoft.VisualBasic.FileIO.RecycleOption.SendToRecycleBin);
-            RemoveItemFromBox(item);
-            Logger.Log($"Файл отправлен в корзину: {item.FullPath}");
+
+            // Файл удалён — Restore вернёт FileGone, строку удалим корректно.
+            App.Db.DeleteItem(item.Id);
+            Items.Remove(item);
+            DesktopIconService.RefreshDesktop();
+            Logger.Log($"Удалено: {item.FullPath}");
         }
         catch (Exception ex)
         {
@@ -797,12 +852,24 @@ public partial class BoxWindow : Window
             $"Убрать все элементы из коробки «{Box.Name}»?\n\nФайлы на диске затронуты не будут, скрытые ярлыки вернутся на рабочий стол.",
             "Очистка коробки", MessageBoxButton.YesNo, MessageBoxImage.Question, MessageBoxResult.No);
         if (answer != MessageBoxResult.Yes) return;
+
+        var kept = 0;
         foreach (var it in Items.ToList())
         {
-            if (it.HiddenByApp) DesktopIconService.Restore(it.FullPath);
+            if (it.HiddenByApp &&
+                DesktopIconService.Restore(it.FullPath, it.AddedAttributes) == RestoreResult.Failed)
+            {
+                kept++; // не удалось вернуть на стол — оставляем в коробке
+                continue;
+            }
             App.Db.DeleteItem(it.Id);
+            Items.Remove(it);
         }
         DesktopIconService.RefreshDesktop();
-        Items.Clear();
+
+        if (kept > 0)
+            MessageBox.Show(
+                $"{kept} элемент(ов) не удалось вернуть на рабочий стол — они оставлены в коробке. Подробности в логе.",
+                "Очистка коробки", MessageBoxButton.OK, MessageBoxImage.Warning);
     }
 }

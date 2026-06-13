@@ -62,19 +62,24 @@ public sealed class AlignmentOverlay : Window
     [DllImport("user32.dll")]
     private static extern int SetWindowLong(IntPtr hwnd, int index, int value);
 
-    /// <summary>Показывает направляющие. Координаты — экранные, в DIP; null — линии нет.</summary>
-    public void ShowGuides(double? screenX, double? screenY)
+    /// <summary>
+    /// Показывает направляющие по координатам в ФИЗИЧЕСКИХ пикселях; конвертирует их в DIP
+    /// по собственному DPI оверлея (а не перетаскиваемого окна), null — линии нет.
+    /// </summary>
+    public void ShowGuidesPhysical(int? physX, int? physY)
     {
-        if (screenX == null && screenY == null)
+        if (physX == null && physY == null)
         {
             HideGuides();
             return;
         }
         if (!IsVisible) Show();
 
-        if (screenX is { } x)
+        var dpi = VisualTreeHelper.GetDpi(this);
+
+        if (physX is { } x)
         {
-            _vertical.X1 = _vertical.X2 = x - Left;
+            _vertical.X1 = _vertical.X2 = x / dpi.DpiScaleX - Left;
             _vertical.Y1 = 0;
             _vertical.Y2 = Height;
             _vertical.Visibility = Visibility.Visible;
@@ -84,9 +89,9 @@ public sealed class AlignmentOverlay : Window
             _vertical.Visibility = Visibility.Collapsed;
         }
 
-        if (screenY is { } y)
+        if (physY is { } y)
         {
-            _horizontal.Y1 = _horizontal.Y2 = y - Top;
+            _horizontal.Y1 = _horizontal.Y2 = y / dpi.DpiScaleY - Top;
             _horizontal.X1 = 0;
             _horizontal.X2 = Width;
             _horizontal.Visibility = Visibility.Visible;

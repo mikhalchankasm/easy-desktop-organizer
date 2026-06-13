@@ -32,8 +32,11 @@ public class BoxItem
     public int DisplayOrder { get; set; }
     public bool IsMissing { get; set; }
 
-    /// <summary>Ярлык скрыт с рабочего стола атрибутом Hidden (возвращается при выходе/удалении из коробки).</summary>
+    /// <summary>Ярлык скрыт с рабочего стола приложением (возвращается при выходе/удалении из коробки).</summary>
     public bool HiddenByApp { get; set; }
+
+    /// <summary>Какие биты атрибутов (Hidden/System) реально добавило приложение — их и снимать при возврате.</summary>
+    public System.IO.FileAttributes AddedAttributes { get; set; }
 
     // Не хранится в БД — иконка для отображения.
     public System.Windows.Media.ImageSource? Icon { get; set; }

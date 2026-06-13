@@ -43,6 +43,9 @@ Filename: "{app}\{#MyAppExeName}"; Description: "Запустить {#MyAppName}
 [UninstallRun]
 ; Останавливаем приложение перед удалением
 Filename: "{cmd}"; Parameters: "/C taskkill /IM {#MyAppExeName} /F"; Flags: runhidden; RunOnceId: "KillApp"
+; Возвращаем все скрытые ярлыки на рабочий стол, чтобы после удаления программы
+; пользователь не потерял к ним доступ.
+Filename: "{app}\{#MyAppExeName}"; Parameters: "--restore-hidden"; Flags: runhidden waituntilterminated; RunOnceId: "RestoreHidden"
 
 [Code]
 // При полном удалении спрашиваем, удалять ли пользовательские данные (настройки/БД сохраняются по умолчанию — раздел 13 ТЗ).

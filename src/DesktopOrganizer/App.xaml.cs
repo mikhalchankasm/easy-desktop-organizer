@@ -22,6 +22,7 @@ public partial class App : Application
 
     private readonly Dictionary<long, BoxWindow> _boxWindows = new();
     private WinForms.NotifyIcon? _tray;
+    private System.Drawing.Icon? _ownedTrayIcon; // извлечённая иконка — освобождаем отдельно
     private HotkeyManager? _hotkeys;
     private SearchWindow? _searchWindow;
     private AlignmentOverlay? _overlay;
@@ -33,8 +34,17 @@ public partial class App : Application
 
     protected override void OnStartup(StartupEventArgs e)
     {
-        // Единственный экземпляр.
-        _singleInstanceMutex = new Mutex(true, "DesktopOrganizer_SingleInstance", out var isNew);
+        // Recovery-режим (вызывается деинсталлятором / вручную): вернуть все скрытые
+        // ярлыки на рабочий стол и сразу выйти. Должен работать даже как второй экземпляр.
+        if (e.Args.Any(a => string.Equals(a, "--restore-hidden", StringComparison.OrdinalIgnoreCase)))
+        {
+            RunRestoreHiddenAndExit();
+            return;
+        }
+
+        // Единственный экземпляр (на пользователя — иначе в разных сессиях будет конфликт).
+        var mutexName = $"Local\\DesktopOrganizer_{Environment.UserName}";
+        _singleInstanceMutex = new Mutex(true, mutexName, out var isNew);
         if (!isNew)
         {
             MessageBox.Show("Desktop Organizer уже запущен (значок в системном трее).",
@@ -51,12 +61,7 @@ public partial class App : Application
             Logger.Error("AppDomain", (args.ExceptionObject as Exception) ?? new Exception("unknown"));
 
         Db = new Db();
-
-        // Элементы, лежащие в коробках, снова скрываем с рабочего стола
-        // (при прошлом выходе их иконки были возвращены на стол).
-        var hiddenPaths = Db.GetHiddenItemPaths();
-        foreach (var path in hiddenPaths) DesktopIconService.Hide(path);
-        if (hiddenPaths.Count > 0) DesktopIconService.RefreshDesktop();
+        RehideOnStartup();
 
         LoadAndShowBoxes();
         InitTray();
@@ -64,6 +69,52 @@ public partial class App : Application
 
         // Двойной клик по пустому рабочему столу — скрыть/показать коробки (раздел 4.3 ТЗ).
         _desktopWatcher = new DesktopDoubleClickWatcher(Dispatcher, ToggleBoxesVisibility);
+    }
+
+    /// <summary>
+    /// Снова скрывает со стола элементы, лежащие в коробках. После штатного выхода они были
+    /// возвращены на стол; после сбоя — остались скрытыми, тогда сохранённые AddedAttributes
+    /// не перезаписываем (Hide вернёт AlreadyHidden).
+    /// </summary>
+    private void RehideOnStartup()
+    {
+        var hidden = Db.GetHiddenItems();
+        var any = false;
+        foreach (var it in hidden)
+        {
+            var outcome = DesktopIconService.Hide(it.FullPath, out var added);
+            if (outcome == HideResult.Hidden)
+            {
+                Db.SetItemHidden(it.Id, true, added);
+                any = true;
+            }
+            else if (outcome == HideResult.AlreadyHidden)
+            {
+                any = true; // уже скрыт (после сбоя) — сохранённые биты оставляем
+            }
+        }
+        if (any) DesktopIconService.RefreshDesktop();
+    }
+
+    private void RunRestoreHiddenAndExit()
+    {
+        try
+        {
+            using var db = new Db();
+            var hidden = db.GetHiddenItems();
+            foreach (var it in hidden)
+            {
+                DesktopIconService.Restore(it.FullPath, it.AddedAttributes);
+                db.SetItemHidden(it.Id, false, 0);
+            }
+            if (hidden.Count > 0) DesktopIconService.RefreshDesktop();
+            Logger.Log($"--restore-hidden: восстановлено {hidden.Count} элементов");
+        }
+        catch (Exception ex)
+        {
+            Logger.Error("RestoreHidden", ex);
+        }
+        Shutdown();
     }
 
     private void OnUnhandledException(object sender, DispatcherUnhandledExceptionEventArgs e)
@@ -74,21 +125,38 @@ public partial class App : Application
 
     protected override void OnExit(ExitEventArgs e)
     {
-        // Db может быть null, если это второй экземпляр и мы вышли из OnStartup досрочно.
+        // Каждый шаг защищён отдельно: возврат файлов на стол не должен срываться
+        // из-за ошибки сохранения геометрии или освобождения ресурсов (раздел 6.2 ТЗ).
+
+        // 1. Возврат скрытых ярлыков на рабочий стол — самое важное, делаем первым.
+        // Db может быть null, если это был второй экземпляр / recovery и мы вышли досрочно.
         if (Db != null)
         {
-            foreach (var w in _boxWindows.Values) w.PersistNow();
-
-            // При выходе возвращаем все скрытые ярлыки на рабочий стол —
-            // без запущенного приложения пользователь не должен терять доступ к файлам.
-            var hiddenPaths = Db.GetHiddenItemPaths();
-            foreach (var path in hiddenPaths) DesktopIconService.Restore(path);
-            if (hiddenPaths.Count > 0) DesktopIconService.RefreshDesktop();
+            try
+            {
+                var hidden = Db.GetHiddenItems();
+                foreach (var it in hidden) DesktopIconService.Restore(it.FullPath, it.AddedAttributes);
+                if (hidden.Count > 0) DesktopIconService.RefreshDesktop();
+            }
+            catch (Exception ex) { Logger.Error("OnExit.Restore", ex); }
         }
-        _hotkeys?.Dispose();
-        _desktopWatcher?.Dispose();
-        if (_tray != null) { _tray.Visible = false; _tray.Dispose(); }
-        Db?.Dispose();
+
+        // 2. Сохранение геометрии коробок.
+        try { foreach (var w in _boxWindows.Values) w.PersistNow(); }
+        catch (Exception ex) { Logger.Error("OnExit.Persist", ex); }
+
+        // 3. Освобождение ресурсов.
+        try { _hotkeys?.Dispose(); } catch (Exception ex) { Logger.Error("OnExit.Hotkeys", ex); }
+        try { _desktopWatcher?.Dispose(); } catch (Exception ex) { Logger.Error("OnExit.MouseHook", ex); }
+        try
+        {
+            if (_tray != null) { _tray.Visible = false; _tray.Dispose(); }
+            _ownedTrayIcon?.Dispose();
+        }
+        catch (Exception ex) { Logger.Error("OnExit.Tray", ex); }
+        try { Db?.Dispose(); } catch (Exception ex) { Logger.Error("OnExit.Db", ex); }
+        try { _singleInstanceMutex?.Dispose(); } catch { /* не критично */ }
+
         Logger.Log("=== Завершение приложения ===");
         base.OnExit(e);
     }
@@ -166,9 +234,19 @@ public partial class App : Application
             "Удаление коробки", MessageBoxButton.YesNo, MessageBoxImage.Question, MessageBoxResult.No);
         if (answer != MessageBoxResult.Yes) return;
 
+        var kept = new List<BoxItem>();
         foreach (var it in w.Items.Where(i => i.HiddenByApp))
-            DesktopIconService.Restore(it.FullPath);
+            if (DesktopIconService.Restore(it.FullPath, it.AddedAttributes) == RestoreResult.Failed)
+                kept.Add(it);
         DesktopIconService.RefreshDesktop();
+
+        if (kept.Count > 0)
+        {
+            MessageBox.Show(
+                $"{kept.Count} ярлык(ов) не удалось вернуть на рабочий стол. Коробка не удалена, чтобы не потерять доступ к файлам. Подробности в логе.",
+                "Удаление коробки", MessageBoxButton.OK, MessageBoxImage.Warning);
+            return;
+        }
 
         Db.DeleteBox(w.Box.Id);
         _boxWindows.Remove(w.Box.Id);
@@ -231,10 +309,11 @@ public partial class App : Application
         foreach (var it in migrated)
         {
             Db.UpdateItemPath(it.Id, it.FullPath);
-            if (DesktopIconService.Hide(it.FullPath) == HideResult.Hidden)
+            if (DesktopIconService.Hide(it.FullPath, out var added) == HideResult.Hidden)
             {
                 it.HiddenByApp = true;
-                Db.SetItemHiddenFlag(it.Id, true);
+                it.AddedAttributes = added;
+                Db.SetItemHidden(it.Id, true, added);
             }
             RefreshBox(it.BoxId);
         }
@@ -315,8 +394,9 @@ public partial class App : Application
         System.Drawing.Icon trayIcon;
         try
         {
-            trayIcon = System.Drawing.Icon.ExtractAssociatedIcon(Environment.ProcessPath!)
-                       ?? System.Drawing.SystemIcons.Application;
+            // ExtractAssociatedIcon создаёт новый Icon — его нужно явно освободить (см. OnExit).
+            _ownedTrayIcon = System.Drawing.Icon.ExtractAssociatedIcon(Environment.ProcessPath!);
+            trayIcon = _ownedTrayIcon ?? System.Drawing.SystemIcons.Application;
         }
         catch
         {

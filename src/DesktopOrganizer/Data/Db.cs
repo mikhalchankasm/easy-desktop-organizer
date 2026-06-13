@@ -15,6 +15,7 @@ public sealed class Db : IDisposable
 
     private readonly SqliteConnection _conn;
     private readonly object _lock = new();
+    private SqliteTransaction? _tx;
 
     public Db()
     {
@@ -62,11 +63,22 @@ public sealed class Db : IDisposable
                 UpdatedAt TEXT);
             """);
         Exec("PRAGMA foreign_keys = ON;");
+        Exec("PRAGMA journal_mode = WAL;");   // устойчивее к сбоям
+        Exec("PRAGMA busy_timeout = 5000;");  // не падать на кратковременных блокировках
 
         if (!ColumnExists("Items", "HiddenByApp"))
             Exec("ALTER TABLE Items ADD COLUMN HiddenByApp INTEGER NOT NULL DEFAULT 0");
         if (!ColumnExists("Boxes", "IconSize"))
             Exec("ALTER TABLE Boxes ADD COLUMN IconSize INTEGER NOT NULL DEFAULT 32");
+        if (!ColumnExists("Items", "AddedAttributes"))
+        {
+            // Какие биты атрибутов (Hidden=2, System=4) поставило приложение — чтобы при
+            // возврате снять РОВНО их и не испортить исходные атрибуты пользователя.
+            Exec("ALTER TABLE Items ADD COLUMN AddedAttributes INTEGER NOT NULL DEFAULT 0");
+            // Legacy: старые версии всегда ставили Hidden|System (=6). Записываем это
+            // одноразово для уже скрытых элементов, иначе их нечем будет «развидеть».
+            Exec("UPDATE Items SET AddedAttributes=6 WHERE HiddenByApp=1 AND AddedAttributes=0");
+        }
     }
 
     private bool ColumnExists(string table, string column)
@@ -89,9 +101,34 @@ public sealed class Db : IDisposable
         lock (_lock)
         {
             using var cmd = _conn.CreateCommand();
+            cmd.Transaction = _tx;
             cmd.CommandText = sql;
             foreach (var (k, v) in args) cmd.Parameters.AddWithValue(k, v ?? DBNull.Value);
             cmd.ExecuteNonQuery();
+        }
+    }
+
+    /// <summary>Выполняет несколько изменений атомарно (всё или ничего).</summary>
+    private void RunInTransaction(Action body)
+    {
+        lock (_lock)
+        {
+            using var tx = _conn.BeginTransaction();
+            _tx = tx;
+            try
+            {
+                body();
+                tx.Commit();
+            }
+            catch
+            {
+                tx.Rollback();
+                throw;
+            }
+            finally
+            {
+                _tx = null;
+            }
         }
     }
 
@@ -158,11 +195,11 @@ public sealed class Db : IDisposable
         ("@lk", b.IsLocked ? 1 : 0), ("@cl", b.IsCollapsed ? 1 : 0), ("@hd", b.IsHidden ? 1 : 0),
         ("@so", b.SortOrder), ("@ic", b.IconSize), ("@t", Now()), ("@id", b.Id));
 
-    public void DeleteBox(long boxId)
+    public void DeleteBox(long boxId) => RunInTransaction(() =>
     {
         Exec("DELETE FROM Items WHERE BoxId=@id", ("@id", boxId));
         Exec("DELETE FROM Boxes WHERE Id=@id", ("@id", boxId));
-    }
+    });
 
     // ---------- Items ----------
 
@@ -172,7 +209,7 @@ public sealed class Db : IDisposable
         lock (_lock)
         {
             using var cmd = _conn.CreateCommand();
-            cmd.CommandText = "SELECT Id,BoxId,Name,FullPath,ItemType,Extension,DisplayOrder,IsMissing,HiddenByApp FROM Items WHERE BoxId=@b ORDER BY DisplayOrder, Id";
+            cmd.CommandText = "SELECT Id,BoxId,Name,FullPath,ItemType,Extension,DisplayOrder,IsMissing,HiddenByApp,AddedAttributes FROM Items WHERE BoxId=@b ORDER BY DisplayOrder, Id";
             cmd.Parameters.AddWithValue("@b", boxId);
             using var r = cmd.ExecuteReader();
             while (r.Read()) list.Add(ReadItem(r));
@@ -186,6 +223,7 @@ public sealed class Db : IDisposable
         FullPath = r.GetString(3), ItemType = r.GetString(4), Extension = r.GetString(5),
         DisplayOrder = (int)r.GetInt64(6), IsMissing = r.GetInt64(7) != 0,
         HiddenByApp = r.GetInt64(8) != 0,
+        AddedAttributes = (System.IO.FileAttributes)r.GetInt64(9),
     };
 
     public long InsertItem(BoxItem it)
@@ -193,12 +231,14 @@ public sealed class Db : IDisposable
         lock (_lock)
         {
             using var cmd = _conn.CreateCommand();
+            cmd.Transaction = _tx;
             cmd.CommandText = """
-                INSERT INTO Items(BoxId,Name,FullPath,ItemType,Extension,DisplayOrder,IsMissing,HiddenByApp,CreatedAt,UpdatedAt)
-                VALUES(@b,@n,@p,@tp,@e,@o,@m,@hb,@t,@t);
+                INSERT INTO Items(BoxId,Name,FullPath,ItemType,Extension,DisplayOrder,IsMissing,HiddenByApp,AddedAttributes,CreatedAt,UpdatedAt)
+                VALUES(@b,@n,@p,@tp,@e,@o,@m,@hb,@aa,@t,@t);
                 SELECT last_insert_rowid();
                 """;
             cmd.Parameters.AddWithValue("@hb", it.HiddenByApp ? 1 : 0);
+            cmd.Parameters.AddWithValue("@aa", (long)it.AddedAttributes);
             cmd.Parameters.AddWithValue("@b", it.BoxId);
             cmd.Parameters.AddWithValue("@n", it.Name);
             cmd.Parameters.AddWithValue("@p", it.FullPath);
@@ -223,8 +263,9 @@ public sealed class Db : IDisposable
     public void UpdateItemPath(long itemId, string path) =>
         Exec("UPDATE Items SET FullPath=@p, UpdatedAt=@t WHERE Id=@id", ("@p", path), ("@t", Now()), ("@id", itemId));
 
-    public void SetItemHiddenFlag(long itemId, bool hidden) =>
-        Exec("UPDATE Items SET HiddenByApp=@h, UpdatedAt=@t WHERE Id=@id", ("@h", hidden ? 1 : 0), ("@t", Now()), ("@id", itemId));
+    public void SetItemHidden(long itemId, bool hidden, System.IO.FileAttributes added) =>
+        Exec("UPDATE Items SET HiddenByApp=@h, AddedAttributes=@aa, UpdatedAt=@t WHERE Id=@id",
+            ("@h", hidden ? 1 : 0), ("@aa", (long)added), ("@t", Now()), ("@id", itemId));
 
     public void UpdateItemOrder(long itemId, int order) =>
         Exec("UPDATE Items SET DisplayOrder=@o, UpdatedAt=@t WHERE Id=@id", ("@o", order), ("@t", Now()), ("@id", itemId));
@@ -232,16 +273,24 @@ public sealed class Db : IDisposable
     public void SetItemMissing(long itemId, bool missing) =>
         Exec("UPDATE Items SET IsMissing=@m WHERE Id=@id", ("@m", missing ? 1 : 0), ("@id", itemId));
 
-    /// <summary>Пути всех элементов, скрытых приложением с рабочего стола (для восстановления/повторного скрытия).</summary>
-    public List<string> GetHiddenItemPaths()
+    /// <summary>Элементы, скрытые приложением (для восстановления/повторного скрытия с правильными битами).</summary>
+    public List<BoxItem> GetHiddenItems()
     {
-        var list = new List<string>();
+        var list = new List<BoxItem>();
         lock (_lock)
         {
             using var cmd = _conn.CreateCommand();
-            cmd.CommandText = "SELECT FullPath FROM Items WHERE HiddenByApp=1";
+            cmd.CommandText = "SELECT Id,BoxId,FullPath,AddedAttributes FROM Items WHERE HiddenByApp=1";
             using var r = cmd.ExecuteReader();
-            while (r.Read()) list.Add(r.GetString(0));
+            while (r.Read())
+                list.Add(new BoxItem
+                {
+                    Id = r.GetInt64(0),
+                    BoxId = r.GetInt64(1),
+                    FullPath = r.GetString(2),
+                    AddedAttributes = (System.IO.FileAttributes)r.GetInt64(3),
+                    HiddenByApp = true,
+                });
         }
         return list;
     }

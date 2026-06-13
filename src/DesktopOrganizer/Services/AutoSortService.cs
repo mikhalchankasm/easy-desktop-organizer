@@ -32,16 +32,35 @@ public static class AutoSortService
         foreach (var dir in DesktopFolders())
         {
             if (!Directory.Exists(dir)) continue;
-            foreach (var entry in Directory.EnumerateFileSystemEntries(dir))
-            {
-                var name = Path.GetFileName(entry);
-                if (name.Equals("desktop.ini", StringComparison.OrdinalIgnoreCase)) continue;
-                if (known.Contains(entry)) continue;
 
-                var category = Categorize(entry);
-                if (!plan.TryGetValue(category, out var list))
-                    plan[category] = list = new List<string>();
-                list.Add(entry);
+            string[] entries;
+            try
+            {
+                entries = Directory.GetFileSystemEntries(dir); // материализуем, чтобы один сбойный entry не сорвал всё
+            }
+            catch (Exception ex)
+            {
+                Logger.Error($"AutoSort.Enumerate '{dir}'", ex);
+                continue;
+            }
+
+            foreach (var entry in entries)
+            {
+                try
+                {
+                    var name = Path.GetFileName(entry);
+                    if (name.Equals("desktop.ini", StringComparison.OrdinalIgnoreCase)) continue;
+                    if (known.Contains(entry)) continue;
+
+                    var category = Categorize(entry);
+                    if (!plan.TryGetValue(category, out var list))
+                        plan[category] = list = new List<string>();
+                    list.Add(entry);
+                }
+                catch (Exception ex)
+                {
+                    Logger.Error($"AutoSort.Entry '{entry}'", ex);
+                }
             }
         }
         return plan;

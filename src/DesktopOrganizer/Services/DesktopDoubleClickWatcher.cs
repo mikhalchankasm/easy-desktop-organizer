@@ -19,6 +19,7 @@ public sealed class DesktopDoubleClickWatcher : IDisposable
     private const int LVM_HITTEST = LVM_FIRST + 18;
     private const uint GA_ROOT = 2;
     private const int SM_CXDOUBLECLK = 36, SM_CYDOUBLECLK = 37;
+    private const uint SMTO_ABORTIFHUNG = 0x0002;
     private const uint PROCESS_VM_OPERATION = 0x0008, PROCESS_VM_WRITE = 0x0020, PROCESS_VM_READ = 0x0010;
     private const uint MEM_COMMIT = 0x1000, MEM_RESERVE = 0x2000, MEM_RELEASE = 0x8000;
     private const uint PAGE_READWRITE = 0x04;
@@ -58,7 +59,8 @@ public sealed class DesktopDoubleClickWatcher : IDisposable
     [DllImport("user32.dll")] private static extern uint GetDoubleClickTime();
     [DllImport("user32.dll")] private static extern int GetSystemMetrics(int idx);
     [DllImport("user32.dll")] private static extern uint GetWindowThreadProcessId(IntPtr h, out uint pid);
-    [DllImport("user32.dll")] private static extern IntPtr SendMessage(IntPtr h, int msg, IntPtr w, IntPtr l);
+    [DllImport("user32.dll", SetLastError = true)]
+    private static extern IntPtr SendMessageTimeout(IntPtr h, int msg, IntPtr w, IntPtr l, uint flags, uint timeoutMs, out IntPtr result);
 
     [DllImport("kernel32.dll", SetLastError = true)] private static extern IntPtr OpenProcess(uint access, bool inherit, uint pid);
     [DllImport("kernel32.dll", SetLastError = true)] private static extern bool CloseHandle(IntPtr h);
@@ -94,8 +96,10 @@ public sealed class DesktopDoubleClickWatcher : IDisposable
             if (isDouble)
             {
                 _lastDownTime = 0; // не реагировать на тройной клик
-                if (IsEmptyDesktop(data.pt))
-                    _dispatcher.BeginInvoke(_onDesktopDoubleClick);
+                var pt = data.pt;
+                // Тяжёлую проверку (cross-process к Explorer) выполняем ВНЕ hook через dispatcher,
+                // иначе при зависшем Explorer подвиснет глобальный ввод и Windows снимет хук.
+                _dispatcher.BeginInvoke(() => { if (IsEmptyDesktop(pt)) _onDesktopDoubleClick(); });
             }
             else
             {
@@ -116,7 +120,10 @@ public sealed class DesktopDoubleClickWatcher : IDisposable
             if (ClassName(h) != "SysListView32") return false; // не область иконок стола
             var rootCls = ClassName(GetAncestor(h, GA_ROOT));
             if (rootCls != "Progman" && rootCls != "WorkerW") return false; // окно Проводника, а не стол
-            return !IconUnderCursor(h, screenPt);
+
+            // Fail-closed: жест срабатывает, только если ТОЧНО установлено, что иконки нет.
+            // Если hit-test недоступен (null) — не выполняем жест.
+            return IconUnderCursor(h, screenPt) == false;
         }
         catch (Exception ex)
         {
@@ -125,18 +132,21 @@ public sealed class DesktopDoubleClickWatcher : IDisposable
         }
     }
 
-    /// <summary>Есть ли иконка стола под курсором (cross-process LVM_HITTEST в explorer.exe).</summary>
-    private static bool IconUnderCursor(IntPtr listView, POINT screenPt)
+    /// <summary>
+    /// Иконка стола под курсором (cross-process LVM_HITTEST в explorer.exe):
+    /// true — иконка есть, false — пусто, null — определить не удалось.
+    /// </summary>
+    private static bool? IconUnderCursor(IntPtr listView, POINT screenPt)
     {
         var clientPt = screenPt;
-        ScreenToClient(listView, ref clientPt);
+        if (!ScreenToClient(listView, ref clientPt)) return null;
 
         GetWindowThreadProcessId(listView, out var pid);
         var hProc = OpenProcess(PROCESS_VM_OPERATION | PROCESS_VM_READ | PROCESS_VM_WRITE, false, pid);
         if (hProc == IntPtr.Zero)
         {
-            Logger.Log("IconUnderCursor: OpenProcess(explorer) не удался");
-            return false;
+            Logger.Log($"IconUnderCursor: OpenProcess(explorer) не удался err={Marshal.GetLastWin32Error()}");
+            return null;
         }
 
         var size = Marshal.SizeOf<LVHITTESTINFO>();
@@ -144,11 +154,24 @@ public sealed class DesktopDoubleClickWatcher : IDisposable
         var local = Marshal.AllocHGlobal(size);
         try
         {
-            if (remote == IntPtr.Zero) return false;
+            if (remote == IntPtr.Zero)
+            {
+                Logger.Log($"IconUnderCursor: VirtualAllocEx не удался err={Marshal.GetLastWin32Error()}");
+                return null;
+            }
             Marshal.StructureToPtr(new LVHITTESTINFO { pt = clientPt }, local, false);
-            WriteProcessMemory(hProc, remote, local, (IntPtr)size, out _);
-            var idx = SendMessage(listView, LVM_HITTEST, IntPtr.Zero, remote).ToInt32();
-            return idx >= 0;
+            if (!WriteProcessMemory(hProc, remote, local, (IntPtr)size, out var written) || written != (IntPtr)size)
+            {
+                Logger.Log($"IconUnderCursor: WriteProcessMemory не удался err={Marshal.GetLastWin32Error()}");
+                return null;
+            }
+            // С таймаутом, чтобы зависший Explorer не блокировал нас.
+            if (SendMessageTimeout(listView, LVM_HITTEST, IntPtr.Zero, remote, SMTO_ABORTIFHUNG, 200, out var lr) == IntPtr.Zero)
+            {
+                Logger.Log("IconUnderCursor: Explorer не ответил на LVM_HITTEST");
+                return null;
+            }
+            return lr.ToInt32() >= 0;
         }
         finally
         {
