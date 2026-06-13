@@ -52,18 +52,14 @@ public static class HideJournal
             foreach (var line in ReadAllLinesShared(FilePath))
             {
                 if (line.Length == 0) continue; // пустые строки игнорируем
-                var tab = line.IndexOf('\t');
-                var path = tab > 0 ? line[(tab + 1)..] : "";
-                // Fail-closed: формат, непустой путь, биты — ненулевое подмножество HideMask
-                // (повреждённое валидное число не должно дать снятие произвольных атрибутов).
-                if (tab <= 0 || path.Length == 0 || !int.TryParse(line[..tab], out var bitsInt)
-                    || !HideAttributes.IsValidAddedBits((FileAttributes)bitsInt))
+                // Разбор и fail-closed-валидация — общий контракт с записью (JournalFormat в Core).
+                if (!JournalFormat.TryParseLine(line, out var path, out var bits))
                 {
                     Logger.Log($"HideJournal: некорректная строка, чтение прервано (fail-closed): {line}");
                     map = new Dictionary<string, FileAttributes>(StringComparer.OrdinalIgnoreCase);
                     return false;
                 }
-                map[path] = (FileAttributes)bitsInt;
+                map[path] = bits;
             }
             return true;
         }
@@ -84,7 +80,7 @@ public static class HideJournal
             using (var fs = new FileStream(tmp, FileMode.Create, FileAccess.Write, FileShare.None))
             using (var sw = new StreamWriter(fs))
             {
-                foreach (var kv in map) sw.Write($"{(int)kv.Value}\t{kv.Key}\n");
+                foreach (var kv in map) { sw.Write(JournalFormat.FormatLine(kv.Key, kv.Value)); sw.Write('\n'); }
                 sw.Flush();
                 fs.Flush(flushToDisk: true); // буферы ОС → физический диск
             }
