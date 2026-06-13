@@ -138,11 +138,16 @@ public static class DesktopIconService
                 Logger.Log($"Restore: биты вне HideMask отброшены ({bits} → {masked}): {path}");
             bits = masked;
 
+            // Запись в журнале есть только при Found. Для DB-only fallback (NotFound) записи нет,
+            // и поддерживать инвариант «запись ⟺ скрыт нами» нечем: неудача Remove (например,
+            // временная занятость mutex) не должна признавать успешный restore неудачей и re-hide'ить.
+            var hadEntry = lk == JournalLookup.Found;
+
             if (!File.Exists(path) && !Directory.Exists(path))
             {
-                // Файл удалён. Если запись журнала не убрать — НЕ считаем успехом: иначе stale-запись
-                // позже снимет Hidden/System с нового файла, появившегося по тому же пути.
-                if (!HideJournal.Remove(path))
+                // Файл удалён. Если запись журнала была, но её не убрать — НЕ считаем успехом: иначе
+                // stale-запись позже снимет Hidden/System с нового файла по тому же пути.
+                if (hadEntry && !HideJournal.Remove(path))
                 {
                     Logger.Log($"Restore: файл отсутствует, но журнал не очищен — повторим позже: {path}");
                     return RestoreResult.Failed;
@@ -171,22 +176,31 @@ public static class DesktopIconService
                     return RestoreResult.Failed;
                 }
             }
-            if (!HideJournal.Remove(path))
+            if (hadEntry)
             {
-                // Запись журнала не убрана — возвращаем файл в скрытое состояние, чтобы инвариант
-                // «запись в журнале ⟺ файл скрыт нами» сохранялся и повторный recovery не снял
-                // потом потенциально пользовательские биты. Считаем восстановление неуспешным.
-                Logger.Log($"Restore: журнал не очищен, возвращаем файл в скрытое состояние: {path}");
-                try
+                if (!HideJournal.Remove(path))
                 {
-                    if (bits != 0)
+                    // Запись журнала не убрана — возвращаем файл в скрытое состояние, чтобы инвариант
+                    // «запись в журнале ⟺ файл скрыт нами» сохранялся и повторный recovery не снял
+                    // потом потенциально пользовательские биты. Считаем восстановление неуспешным.
+                    Logger.Log($"Restore: журнал не очищен, возвращаем файл в скрытое состояние: {path}");
+                    try
                     {
-                        var a = File.GetAttributes(path);
-                        File.SetAttributes(path, a | bits);
+                        if (bits != 0)
+                        {
+                            var a = File.GetAttributes(path);
+                            File.SetAttributes(path, a | bits);
+                        }
                     }
+                    catch (Exception ex) { Logger.Error("Restore.re-hide", ex); }
+                    return RestoreResult.Failed;
                 }
-                catch (Exception ex) { Logger.Error("Restore.re-hide", ex); }
-                return RestoreResult.Failed;
+            }
+            else
+            {
+                // DB-only путь: записи в журнале не было. Файл уже возвращён; если из-за гонки запись
+                // всё же появилась — убираем best-effort, но её неудача не повод откатывать restore.
+                HideJournal.Remove(path);
             }
             return RestoreResult.Restored;
         }
