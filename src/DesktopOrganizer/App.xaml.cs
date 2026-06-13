@@ -105,27 +105,11 @@ public partial class App : Application
 
     private void RunRestoreHiddenAndExit()
     {
-        var failed = 0;
+        var failed = -1;
         try
         {
-            // Источник правды — durable-журнал (работает даже если БД повреждена/отсутствует).
-            failed = DesktopIconService.RestoreAllFromJournal();
-            DesktopIconService.RefreshDesktop();
-
-            // Best-effort: чистим флаги в БД ТОЛЬКО для реально восстановленных (нет в журнале).
-            // Пропускаем целиком, если журнал не прочитан (failed < 0) — иначе можно стереть резерв.
-            if (failed >= 0)
-            {
-                try
-                {
-                    using var db = new Db();
-                    foreach (var it in db.GetHiddenItems())
-                        if (HideJournal.Lookup(it.FullPath, out _) == JournalLookup.NotFound)
-                            try { db.SetItemHidden(it.Id, false, 0); } catch { /* не критично */ }
-                }
-                catch (Exception ex) { Logger.Error("RestoreHidden.DbSync", ex); }
-            }
-
+            using var db = new Db();
+            failed = RestoreAllHidden(db, keepMembership: false); // приложение удаляется — членство тоже снимаем
             Logger.Log($"--restore-hidden: результат {failed} (-1 = журнал не прочитан)");
         }
         catch (Exception ex)
@@ -134,6 +118,56 @@ public partial class App : Application
             failed = -1;
         }
         Shutdown(failed == 0 ? 0 : 1); // ненулевой код, если что-то не восстановилось
+    }
+
+    /// <summary>
+    /// Возвращает на стол ВСЕ скрытые элементы — объединение durable-журнала и DB-флагов
+    /// (на случай потерянного/незасеянного журнала: тогда биты берутся из БД). Флаги БД чистит
+    /// ТОЛЬКО для подтверждённо восстановленных. keepMembership=true — оставить HiddenByApp
+    /// (выход, следующий старт снова скроет); false — снять совсем (recovery/деинсталляция).
+    /// Возвращает число неудач, или -1 если журнал не прочитан.
+    /// </summary>
+    private static int RestoreAllHidden(Db? db, bool keepMembership)
+    {
+        if (!HideJournal.TryGetAll(out var journalEntries))
+        {
+            Logger.Log("RestoreAllHidden: журнал не прочитан — восстановление отложено");
+            return -1;
+        }
+
+        // Объединяем пути из журнала и из БД. Биты журнала приоритетнее; для DB-only берём
+        // AddedAttributes (журнал мог быть потерян/не засеян) — иначе файл останется скрытым.
+        var union = new Dictionary<string, (System.IO.FileAttributes Bits, long? ItemId)>(StringComparer.OrdinalIgnoreCase);
+        foreach (var kv in journalEntries) union[kv.Key] = (kv.Value, null);
+
+        if (db != null)
+        {
+            try
+            {
+                foreach (var it in db.GetHiddenItems())
+                    union[it.FullPath] = union.TryGetValue(it.FullPath, out var ex)
+                        ? (ex.Bits, it.Id)                 // журнал есть — его биты, привязываем id
+                        : (it.AddedAttributes, it.Id);     // только БД — fallback по её битам
+            }
+            catch (Exception ex) { Logger.Error("RestoreAllHidden.GetHidden", ex); }
+        }
+
+        var failed = 0;
+        var restoredIds = new List<long>();
+        foreach (var (path, info) in union)
+        {
+            if (DesktopIconService.Restore(path, info.Bits) == RestoreResult.Failed) { failed++; continue; }
+            if (info.ItemId is long id) restoredIds.Add(id);
+        }
+
+        // Флаги БД меняем только для подтверждённо восстановленных.
+        if (db != null)
+            foreach (var id in restoredIds)
+                try { db.SetItemHidden(id, keepMembership, 0); }
+                catch (Exception ex) { Logger.Error("RestoreAllHidden.DbSync", ex); }
+
+        DesktopIconService.RefreshDesktop();
+        return failed;
     }
 
     private void OnUnhandledException(object sender, DispatcherUnhandledExceptionEventArgs e)
@@ -147,33 +181,16 @@ public partial class App : Application
         // Каждый шаг защищён отдельно: возврат файлов на стол не должен срываться
         // из-за ошибки сохранения геометрии или освобождения ресурсов (раздел 6.2 ТЗ).
 
-        // 1. Возврат скрытых ярлыков — по durable-журналу. Не зависит от БД и не прерывается
-        // её сбоями: один проблемный элемент не мешает восстановить остальные.
+        // 1. Возврат скрытых ярлыков — объединение журнала и БД (на случай потерянного журнала),
+        // флаги БД чистим только для подтверждённо восстановленных; членство сохраняем (next start
+        // снова скроет). Не зависит от отдельных сбоев — каждый элемент обрабатывается независимо.
         try
         {
-            var failed = DesktopIconService.RestoreAllFromJournal();
-            DesktopIconService.RefreshDesktop();
+            var failed = RestoreAllHidden(Db, keepMembership: true);
             if (failed > 0)
                 Logger.Log($"OnExit: {failed} файлов не возвращены (останутся в журнале до следующего запуска)");
         }
         catch (Exception ex) { Logger.Error("OnExit.Restore", ex); }
-
-        // 1b. Best-effort синхронизация БД: членство в коробке сохраняем, применённые биты обнуляем
-        // ТОЛЬКО для реально восстановленных (нет в журнале). Для оставшихся скрытыми (Found) или
-        // при нечитаемом журнале (ReadFailed) AddedAttributes НЕ трогаем — это резерв для recovery.
-        if (Db != null)
-        {
-            try
-            {
-                foreach (var it in Db.GetHiddenItems())
-                {
-                    if (HideJournal.Lookup(it.FullPath, out _) != JournalLookup.NotFound) continue;
-                    try { Db.SetItemHidden(it.Id, true, 0); }
-                    catch (Exception ex) { Logger.Error("OnExit.DbSync.item", ex); }
-                }
-            }
-            catch (Exception ex) { Logger.Error("OnExit.DbSync", ex); }
-        }
 
         // 2. Сохранение геометрии коробок.
         try { foreach (var w in _boxWindows.Values) w.PersistNow(); }

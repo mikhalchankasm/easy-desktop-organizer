@@ -134,7 +134,13 @@ public static class DesktopIconService
 
             if (!File.Exists(path) && !Directory.Exists(path))
             {
-                HideJournal.Remove(path);
+                // Файл удалён. Если запись журнала не убрать — НЕ считаем успехом: иначе stale-запись
+                // позже снимет Hidden/System с нового файла, появившегося по тому же пути.
+                if (!HideJournal.Remove(path))
+                {
+                    Logger.Log($"Restore: файл отсутствует, но журнал не очищен — повторим позже: {path}");
+                    return RestoreResult.Failed;
+                }
                 return RestoreResult.FileGone;
             }
             if (bits != 0)
@@ -168,25 +174,6 @@ public static class DesktopIconService
         }
     }
 
-    /// <summary>
-    /// Возвращает на стол ВСЕ файлы из durable-журнала (источник правды, не зависит от БД).
-    /// Используется на выходе, в recovery-режиме и деинсталляторе. Возвращает число неудач.
-    /// </summary>
-    /// <summary>
-    /// Возвращает число неудач, или -1 если журнал НЕ прочитан (нельзя считать «нечего восстанавливать»).
-    /// </summary>
-    public static int RestoreAllFromJournal()
-    {
-        if (!HideJournal.TryGetAll(out var entries))
-        {
-            Logger.Log("RestoreAllFromJournal: журнал не прочитан — восстановление не выполнено");
-            return -1;
-        }
-        var failed = 0;
-        foreach (var kv in entries)
-            if (Restore(kv.Key, kv.Value) == RestoreResult.Failed) failed++;
-        return failed;
-    }
 
     /// <summary>Скопированный на личный стол элемент: модель, исходный (Public) путь, путь копии.</summary>
     public readonly record struct CopyOp(BoxItem Item, string Src, string Dst);

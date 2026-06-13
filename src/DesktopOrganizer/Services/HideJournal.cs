@@ -12,7 +12,7 @@ namespace DesktopOrganizer.Services;
 /// - Мутации (Record/Remove) держат МЕЖПРОЦЕССНЫЙ mutex и читают файл заново. Если mutex не
 ///   получен или файл не прочитан надёжно — операция ОТМЕНЯЕТСЯ (возвращает false), журнал
 ///   не перезаписывается пустым/частичным снимком и существующие записи не теряются.
-/// - Чтения (GetAll/TryGet) делаются без блокировки: запись атомарна (.tmp → replace),
+/// - Чтения (Lookup/TryGetAll) делаются без блокировки: запись атомарна (.tmp → replace),
 ///   поэтому читатель видит либо старый, либо новый цельный файл.
 /// - Запись: FileStream + Flush(true) + атомарная замена. На NTFS переименование журналируется,
 ///   что сводит к минимуму потерю при сбое питания (абсолютной гарантии flush директории нет).
@@ -53,13 +53,18 @@ public static class HideJournal
             {
                 if (line.Length == 0) continue; // пустые строки игнорируем
                 var tab = line.IndexOf('\t');
-                if (tab <= 0 || !int.TryParse(line[..tab], out var bits))
+                var path = tab > 0 ? line[(tab + 1)..] : "";
+                // Fail-closed: формат, непустой путь, ненулевые биты И только из HideMask
+                // (повреждённое валидное число не должно дать снятие произвольных атрибутов).
+                if (tab <= 0 || path.Length == 0 || !int.TryParse(line[..tab], out var bitsInt)
+                    || (FileAttributes)bitsInt == 0
+                    || ((FileAttributes)bitsInt & ~DesktopIconService.HideMask) != 0)
                 {
                     Logger.Log($"HideJournal: некорректная строка, чтение прервано (fail-closed): {line}");
                     map = new Dictionary<string, FileAttributes>(StringComparer.OrdinalIgnoreCase);
                     return false;
                 }
-                map[line[(tab + 1)..]] = (FileAttributes)bits;
+                map[path] = (FileAttributes)bitsInt;
             }
             return true;
         }
