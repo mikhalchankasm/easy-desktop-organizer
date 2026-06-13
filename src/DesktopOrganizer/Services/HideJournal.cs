@@ -54,11 +54,10 @@ public static class HideJournal
                 if (line.Length == 0) continue; // пустые строки игнорируем
                 var tab = line.IndexOf('\t');
                 var path = tab > 0 ? line[(tab + 1)..] : "";
-                // Fail-closed: формат, непустой путь, ненулевые биты И только из HideMask
+                // Fail-closed: формат, непустой путь, биты — ненулевое подмножество HideMask
                 // (повреждённое валидное число не должно дать снятие произвольных атрибутов).
                 if (tab <= 0 || path.Length == 0 || !int.TryParse(line[..tab], out var bitsInt)
-                    || (FileAttributes)bitsInt == 0
-                    || ((FileAttributes)bitsInt & ~DesktopIconService.HideMask) != 0)
+                    || !HideAttributes.IsValidAddedBits((FileAttributes)bitsInt))
                 {
                     Logger.Log($"HideJournal: некорректная строка, чтение прервано (fail-closed): {line}");
                     map = new Dictionary<string, FileAttributes>(StringComparer.OrdinalIgnoreCase);
@@ -133,20 +132,20 @@ public static class HideJournal
 
     /// <summary>
     /// Фиксирует запись. true — ТОЛЬКО при подтверждённой записи; вызывать ДО SetAttributes.
-    /// Биты маскируются до <see cref="DesktopIconService.HideMask"/> и валидируются здесь, на входе:
-    /// иначе повреждённый источник (например, seed из БД с битым AddedAttributes) мог бы записать
-    /// строку, которую потом fail-closed <see cref="TryLoad"/> забракует, сделав ВЕСЬ журнал
-    /// нечитаемым и заблокировав восстановление. Биты вне маски/нулевые → запись отклоняется.
+    /// Строго fail-closed (тот же контракт, что и <see cref="TryLoad"/>): принимаются ТОЛЬКО
+    /// ненулевое подмножество <see cref="DesktopIconService.HideMask"/> без посторонних бит. Лишние
+    /// биты НЕ маскируются молча, а отклоняются — иначе повреждённый источник (например, seed из БД
+    /// с битым AddedAttributes) закрепился бы как «валидная» recovery-запись и скрыл повреждение.
+    /// Маскирование как защита остаётся на стороне Restore/RestorePlanner.
     /// </summary>
     public static bool Record(string path, FileAttributes added)
     {
-        var masked = added & DesktopIconService.HideMask;
-        if (masked == 0 || string.IsNullOrEmpty(path))
+        if (string.IsNullOrEmpty(path) || !HideAttributes.IsValidAddedBits(added))
         {
-            Logger.Log($"HideJournal.Record: биты ({added}) вне HideMask/пусты или пустой путь — запись отклонена (fail-closed): {path}");
+            Logger.Log($"HideJournal.Record: недопустимые биты ({added}) или пустой путь — запись отклонена (fail-closed): {path}");
             return false;
         }
-        return Mutate(map => { map[path] = masked; return true; });
+        return Mutate(map => { map[path] = added; return true; });
     }
 
     /// <summary>Удаляет запись. true — удаление зафиксировано (или записи не было).</summary>

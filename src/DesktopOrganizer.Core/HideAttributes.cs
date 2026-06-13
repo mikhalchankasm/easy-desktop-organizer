@@ -12,4 +12,12 @@ namespace DesktopOrganizer.Services;
 public static class HideAttributes
 {
     public const FileAttributes Mask = FileAttributes.Hidden | FileAttributes.System;
+
+    /// <summary>
+    /// Допустимый ли это набор «добавленных приложением» бит для durable-журнала: ненулевое
+    /// подмножество <see cref="Mask"/> без посторонних флагов. Единый строгий контракт и для
+    /// записи (HideJournal.Record), и для чтения (HideJournal.TryLoad), чтобы журнал никогда
+    /// не содержал бит, способных при восстановлении снять чужие/произвольные атрибуты.
+    /// </summary>
+    public static bool IsValidAddedBits(FileAttributes bits) => bits != 0 && (bits & ~Mask) == 0;
 }
