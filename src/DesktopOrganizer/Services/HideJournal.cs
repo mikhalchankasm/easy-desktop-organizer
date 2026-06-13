@@ -19,24 +19,47 @@ namespace DesktopOrganizer.Services;
 ///
 /// Файл: %LOCALAPPDATA%\DesktopOrganizer\hide-journal.txt, строки "&lt;битыInt&gt;\t&lt;путь&gt;".
 /// </summary>
+/// <summary>Результат точечного поиска в журнале (различаем «не прочитан» и «нет записи»).</summary>
+public enum JournalLookup { Found, NotFound, ReadFailed }
+
 public static class HideJournal
 {
     private static string FilePath => Path.Combine(Db.AppDataDir, "hide-journal.txt");
     private static string MutexName => $"Local\\DesktopOrganizer_Journal_{Environment.UserName}";
 
-    /// <summary>Читает журнал. false — чтение НЕ удалось (нельзя перезаписывать journal!).</summary>
+    /// <summary>Читает все строки с разделяемым доступом (не мешает параллельной атомарной замене).</summary>
+    private static List<string> ReadAllLinesShared(string path)
+    {
+        using var fs = new FileStream(path, FileMode.Open, FileAccess.Read,
+            FileShare.ReadWrite | FileShare.Delete);
+        using var sr = new StreamReader(fs);
+        var lines = new List<string>();
+        string? line;
+        while ((line = sr.ReadLine()) != null) lines.Add(line);
+        return lines;
+    }
+
+    /// <summary>
+    /// Читает журнал. false — чтение НЕ удалось (нельзя перезаписывать journal — потеряем записи!).
+    /// Fail-closed: непустая строка некорректного формата трактуется как сбой, а не молча отбрасывается.
+    /// </summary>
     private static bool TryLoad(out Dictionary<string, FileAttributes> map)
     {
         map = new Dictionary<string, FileAttributes>(StringComparer.OrdinalIgnoreCase);
         try
         {
             if (!File.Exists(FilePath)) return true; // пустой журнал — валидное состояние
-            foreach (var line in File.ReadAllLines(FilePath))
+            foreach (var line in ReadAllLinesShared(FilePath))
             {
+                if (line.Length == 0) continue; // пустые строки игнорируем
                 var tab = line.IndexOf('\t');
-                if (tab <= 0) continue;
-                if (int.TryParse(line[..tab], out var bits))
-                    map[line[(tab + 1)..]] = (FileAttributes)bits;
+                if (tab <= 0 || !int.TryParse(line[..tab], out var bits))
+                {
+                    Logger.Log($"HideJournal: некорректная строка, чтение прервано (fail-closed): {line}");
+                    map = new Dictionary<string, FileAttributes>(StringComparer.OrdinalIgnoreCase);
+                    return false;
+                }
+                map[line[(tab + 1)..]] = (FileAttributes)bits;
             }
             return true;
         }
@@ -111,12 +134,23 @@ public static class HideJournal
     public static bool Remove(string path) =>
         Mutate(map => map.Remove(path));
 
-    public static bool TryGet(string path, out FileAttributes added)
+    /// <summary>Tri-state поиск: Found(+биты) / NotFound / ReadFailed. Не путать «нет» и «не прочитан».</summary>
+    public static JournalLookup Lookup(string path, out FileAttributes added)
     {
         added = 0;
-        return TryLoad(out var map) && map.TryGetValue(path, out added);
+        if (!TryLoad(out var map)) return JournalLookup.ReadFailed;
+        return map.TryGetValue(path, out added) ? JournalLookup.Found : JournalLookup.NotFound;
     }
 
-    public static IReadOnlyList<KeyValuePair<string, FileAttributes>> GetAll() =>
-        TryLoad(out var map) ? map.ToList() : new List<KeyValuePair<string, FileAttributes>>();
+    /// <summary>Все записи. false — журнал не прочитан (НЕ трактовать как «пусто»).</summary>
+    public static bool TryGetAll(out IReadOnlyList<KeyValuePair<string, FileAttributes>> entries)
+    {
+        if (TryLoad(out var map))
+        {
+            entries = map.ToList();
+            return true;
+        }
+        entries = new List<KeyValuePair<string, FileAttributes>>();
+        return false;
+    }
 }

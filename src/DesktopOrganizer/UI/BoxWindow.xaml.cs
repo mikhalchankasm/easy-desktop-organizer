@@ -764,14 +764,25 @@ public partial class BoxWindow : Window
             MessageBoxButton.YesNo, MessageBoxImage.Warning, MessageBoxResult.No);
         if (answer != MessageBoxResult.Yes) return;
 
+        // Снимаем наши атрибуты до удаления (чтобы в корзине не осталось «скрытого+системного»).
+        // Если восстановить не удалось — НЕ удаляем: иначе потеряем согласованность журнала/состояния.
         var preRestored = false;
+        if (item.HiddenByApp)
+        {
+            var rr = DesktopIconService.Restore(item.FullPath, item.AddedAttributes);
+            if (rr == RestoreResult.Failed)
+            {
+                MessageBox.Show(
+                    $"Не удалось снять служебные атрибуты с файла — удаление отменено:\n{item.FullPath}\n\nПопробуйте позже.",
+                    "Desktop Organizer", MessageBoxButton.OK, MessageBoxImage.Warning);
+                DesktopIconService.RefreshDesktop();
+                return;
+            }
+            preRestored = rr == RestoreResult.Restored;
+        }
+
         try
         {
-            // Снимаем наши атрибуты, чтобы в корзине/после удаления не осталось «скрытого+системного».
-            // preRestored=true только если атрибуты ДЕЙСТВИТЕЛЬНО сняты (иначе файл и так остался скрытым).
-            if (item.HiddenByApp)
-                preRestored = DesktopIconService.Restore(item.FullPath, item.AddedAttributes) == RestoreResult.Restored;
-
             if (isReparse)
             {
                 // Reparse-точку удаляем как ссылку, не рекурсивно — иначе можно задеть цель.

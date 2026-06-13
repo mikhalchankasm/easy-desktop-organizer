@@ -122,7 +122,16 @@ public static class DesktopIconService
     {
         try
         {
-            var bits = HideJournal.TryGet(path, out var journaled) ? journaled : added;
+            // Журнал авторитетнее БД. Но если он НЕ прочитан — не угадываем биты из БД
+            // (можно ошибочно признать restore успешным, не сняв атрибуты): считаем неудачей.
+            var lk = HideJournal.Lookup(path, out var journaled);
+            if (lk == JournalLookup.ReadFailed)
+            {
+                Logger.Log($"Restore: журнал не прочитан — откладываем восстановление: {path}");
+                return RestoreResult.Failed;
+            }
+            var bits = lk == JournalLookup.Found ? journaled : added; // NotFound → запасной вариант из БД
+
             if (!File.Exists(path) && !Directory.Exists(path))
             {
                 HideJournal.Remove(path);
@@ -163,10 +172,18 @@ public static class DesktopIconService
     /// Возвращает на стол ВСЕ файлы из durable-журнала (источник правды, не зависит от БД).
     /// Используется на выходе, в recovery-режиме и деинсталляторе. Возвращает число неудач.
     /// </summary>
+    /// <summary>
+    /// Возвращает число неудач, или -1 если журнал НЕ прочитан (нельзя считать «нечего восстанавливать»).
+    /// </summary>
     public static int RestoreAllFromJournal()
     {
+        if (!HideJournal.TryGetAll(out var entries))
+        {
+            Logger.Log("RestoreAllFromJournal: журнал не прочитан — восстановление не выполнено");
+            return -1;
+        }
         var failed = 0;
-        foreach (var kv in HideJournal.GetAll())
+        foreach (var kv in entries)
             if (Restore(kv.Key, kv.Value) == RestoreResult.Failed) failed++;
         return failed;
     }

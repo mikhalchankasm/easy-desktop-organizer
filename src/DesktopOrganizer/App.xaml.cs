@@ -93,9 +93,9 @@ public partial class App : Application
             }
             else if (outcome == HideResult.AlreadyHidden)
             {
-                // Файл уже скрыт. Засеваем журнал из БД, если его там нет — миграция со старых
-                // версий (журнала не было) или после сбоя, иначе OnExit не вернёт файл на стол.
-                if (!HideJournal.TryGet(it.FullPath, out _) && it.AddedAttributes != 0)
+                // Файл уже скрыт. Засеваем журнал из БД, ТОЛЬКО если он прочитан и записи нет
+                // (миграция со старых версий без журнала). На ReadFailed не трогаем, чтобы не плодить дубли.
+                if (HideJournal.Lookup(it.FullPath, out _) == JournalLookup.NotFound && it.AddedAttributes != 0)
                     HideJournal.Record(it.FullPath, it.AddedAttributes);
                 any = true;
             }
@@ -112,17 +112,21 @@ public partial class App : Application
             failed = DesktopIconService.RestoreAllFromJournal();
             DesktopIconService.RefreshDesktop();
 
-            // Best-effort: чистим флаги в БД для тех, кого реально вернули (нет в журнале).
-            try
+            // Best-effort: чистим флаги в БД ТОЛЬКО для реально восстановленных (нет в журнале).
+            // Пропускаем целиком, если журнал не прочитан (failed < 0) — иначе можно стереть резерв.
+            if (failed >= 0)
             {
-                using var db = new Db();
-                foreach (var it in db.GetHiddenItems())
-                    if (!HideJournal.TryGet(it.FullPath, out _))
-                        try { db.SetItemHidden(it.Id, false, 0); } catch { /* не критично */ }
+                try
+                {
+                    using var db = new Db();
+                    foreach (var it in db.GetHiddenItems())
+                        if (HideJournal.Lookup(it.FullPath, out _) == JournalLookup.NotFound)
+                            try { db.SetItemHidden(it.Id, false, 0); } catch { /* не критично */ }
+                }
+                catch (Exception ex) { Logger.Error("RestoreHidden.DbSync", ex); }
             }
-            catch (Exception ex) { Logger.Error("RestoreHidden.DbSync", ex); }
 
-            Logger.Log($"--restore-hidden: не удалось вернуть {failed}");
+            Logger.Log($"--restore-hidden: результат {failed} (-1 = журнал не прочитан)");
         }
         catch (Exception ex)
         {
@@ -154,15 +158,19 @@ public partial class App : Application
         }
         catch (Exception ex) { Logger.Error("OnExit.Restore", ex); }
 
-        // 1b. Best-effort синхронизация БД: членство в коробке сохраняем, применённые биты обнуляем.
-        // Каждый элемент отдельно — сбой одного не прерывает остальные.
+        // 1b. Best-effort синхронизация БД: членство в коробке сохраняем, применённые биты обнуляем
+        // ТОЛЬКО для реально восстановленных (нет в журнале). Для оставшихся скрытыми (Found) или
+        // при нечитаемом журнале (ReadFailed) AddedAttributes НЕ трогаем — это резерв для recovery.
         if (Db != null)
         {
             try
             {
                 foreach (var it in Db.GetHiddenItems())
+                {
+                    if (HideJournal.Lookup(it.FullPath, out _) != JournalLookup.NotFound) continue;
                     try { Db.SetItemHidden(it.Id, true, 0); }
                     catch (Exception ex) { Logger.Error("OnExit.DbSync.item", ex); }
+                }
             }
             catch (Exception ex) { Logger.Error("OnExit.DbSync", ex); }
         }
