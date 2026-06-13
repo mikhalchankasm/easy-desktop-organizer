@@ -35,7 +35,13 @@ Source: "..\src\DesktopOrganizer\bin\Release\net8.0-windows\win-x64\publish\*"; 
 
 [Icons]
 Name: "{group}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"
-Name: "{userstartup}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; Tasks: autostart
+
+[Registry]
+; Автозапуск через HKCU\Run — ТОТ ЖE механизм, которым управляет переключатель в трее
+; (StartupService), чтобы UI всегда показывал корректное состояние. Удаляется при деинсталляции.
+Root: HKCU; Subkey: "Software\Microsoft\Windows\CurrentVersion\Run"; ValueType: string; \
+    ValueName: "DesktopOrganizer"; ValueData: """{app}\{#MyAppExeName}"""; \
+    Flags: uninsdeletevalue; Tasks: autostart
 
 [Run]
 Filename: "{app}\{#MyAppExeName}"; Description: "Запустить {#MyAppName}"; Flags: nowait postinstall skipifsilent

@@ -118,54 +118,47 @@ public static class DesktopIconService
         }
     }
 
+    /// <summary>Скопированный на личный стол элемент: модель, исходный (Public) путь, путь копии.</summary>
+    public readonly record struct CopyOp(BoxItem Item, string Src, string Dst);
+
+    public enum DeleteElevatedResult
+    {
+        /// <summary>Процесс удаления завершился — фактический итог сверять по File.Exists каждого пути.</summary>
+        Completed,
+        /// <summary>Пользователь отклонил UAC или процесс не запустился — НИЧЕГО не удалено.</summary>
+        Declined,
+        /// <summary>Процесс не завершился за таймаут — мог удалить позже, откатывать НЕЛЬЗЯ.</summary>
+        TimedOut,
+        Error,
+    }
+
     /// <summary>
-    /// Переносит общие ярлыки (Public Desktop) на личный рабочий стол: копия всегда делается
-    /// под уникальным именем (никогда не подменяем чужой существующий файл), затем оригиналы
-    /// удаляются одной командой с повышением прав (один запрос UAC на пачку).
-    /// Возвращает элементы, у которых FullPath уже указывает на новое место.
+    /// Копирует элементы на личный рабочий стол под уникальными именами (чужой файл не подменяем).
+    /// Оригиналы НЕ удаляет — это отдельный шаг (см. DeleteElevated). Возвращает выполненные копии.
     /// </summary>
-    public static List<BoxItem> MigratePublicItemsToUserDesktop(IReadOnlyList<BoxItem> items)
+    public static List<CopyOp> CopyToUserDesktop(IReadOnlyList<BoxItem> items)
     {
         var userDesktop = Environment.GetFolderPath(Environment.SpecialFolder.DesktopDirectory);
-        var ops = new List<(BoxItem Item, string Src, string Dst)>();
-
+        var ops = new List<CopyOp>();
         foreach (var it in items)
         {
             try
             {
                 var dst = UniqueDestination(userDesktop, Path.GetFileName(it.FullPath));
-                File.Copy(it.FullPath, dst); // dst гарантированно не существует — чужой файл не затрагиваем
-                ops.Add((it, it.FullPath, dst));
+                File.Copy(it.FullPath, dst); // dst гарантированно не существует
+                ops.Add(new CopyOp(it, it.FullPath, dst));
             }
             catch (Exception ex)
             {
-                Logger.Error("MigratePublic.Copy", ex);
+                Logger.Error("CopyToUserDesktop", ex);
             }
         }
-        if (ops.Count == 0) return new List<BoxItem>();
+        return ops;
+    }
 
-        if (!DeleteElevated(ops.Select(o => o.Src)))
-        {
-            // UAC отклонён или удаление не запустилось — откатываем наши копии целиком.
-            RollbackCopies(ops.Select(o => o.Dst));
-            return new List<BoxItem>();
-        }
-
-        var migrated = new List<BoxItem>();
-        foreach (var o in ops)
-        {
-            if (File.Exists(o.Src))
-            {
-                // Конкретный оригинал не удалился — откатываем его копию, оставляем ссылку на оригинал.
-                TryDelete(o.Dst);
-                Logger.Log($"MigratePublic: оригинал не удалён: {o.Src}");
-                continue;
-            }
-            o.Item.FullPath = o.Dst;
-            migrated.Add(o.Item);
-        }
-        Logger.Log($"MigratePublic: перенесено {migrated.Count} из {items.Count}");
-        return migrated;
+    public static void TryDelete(string path)
+    {
+        try { if (File.Exists(path) || Directory.Exists(path)) File.Delete(path); } catch { /* не критично */ }
     }
 
     private static string UniqueDestination(string dir, string fileName)
@@ -182,58 +175,63 @@ public static class DesktopIconService
     }
 
     /// <summary>
-    /// Удаляет переданные пути с повышением прав. Список пишется во временный файл и
-    /// удаляется через PowerShell -LiteralPath — без склейки и экранирования в командной строке.
+    /// Удаляет переданные пути с повышением прав. Список и скрипт пишутся во временные файлы,
+    /// удаление идёт через PowerShell -LiteralPath (без склейки/экранирования в командной строке —
+    /// безопасно даже если путь профиля содержит апостроф).
     /// </summary>
-    private static bool DeleteElevated(IEnumerable<string> paths)
+    public static DeleteElevatedResult DeleteElevated(IEnumerable<string> paths)
     {
+        var list = paths.ToList();
+        if (list.Count == 0) return DeleteElevatedResult.Completed;
+
         var listFile = Path.Combine(Path.GetTempPath(), $"ied_del_{Guid.NewGuid():N}.txt");
+        var scriptFile = Path.Combine(Path.GetTempPath(), $"ied_del_{Guid.NewGuid():N}.ps1");
+        var result = DeleteElevatedResult.Error;
         try
         {
-            File.WriteAllLines(listFile, paths, new UTF8Encoding(false));
-            var script =
-                $"Get-Content -LiteralPath '{listFile}' -Encoding UTF8 | " +
-                "ForEach-Object { if ($_){ Remove-Item -LiteralPath $_ -Force -ErrorAction SilentlyContinue } }";
+            File.WriteAllLines(listFile, list, new UTF8Encoding(false));
+            // Путь к списку встраиваем в .ps1 как литерал с экранированием апострофа ('→'').
+            var listLiteral = listFile.Replace("'", "''");
+            File.WriteAllText(scriptFile,
+                $"Get-Content -LiteralPath '{listLiteral}' -Encoding UTF8 | " +
+                "ForEach-Object { if ($_) { Remove-Item -LiteralPath $_ -Force -ErrorAction SilentlyContinue } }",
+                new UTF8Encoding(false));
+
             var psi = new ProcessStartInfo("powershell.exe",
-                $"-NoProfile -NonInteractive -ExecutionPolicy Bypass -WindowStyle Hidden -Command \"{script}\"")
+                $"-NoProfile -NonInteractive -ExecutionPolicy Bypass -WindowStyle Hidden -File \"{scriptFile}\"")
             {
                 Verb = "runas",
                 UseShellExecute = true,
                 WindowStyle = ProcessWindowStyle.Hidden,
             };
             using var p = Process.Start(psi);
-            if (p == null) return false;
-            if (!p.WaitForExit(30000))
+            if (p == null) return result = DeleteElevatedResult.Error;
+            if (!p.WaitForExit(60000))
             {
-                Logger.Log("MigratePublic: удаление с повышением прав не завершилось за 30с");
-                return false;
+                Logger.Log("DeleteElevated: процесс не завершился за 60с");
+                return result = DeleteElevatedResult.TimedOut;
             }
-            return true; // фактический успех проверяется по File.Exists каждого оригинала
+            return result = DeleteElevatedResult.Completed;
         }
         catch (Win32Exception)
         {
-            Logger.Log("MigratePublic: повышение прав отклонено пользователем (UAC)");
-            return false;
+            Logger.Log("DeleteElevated: повышение прав отклонено (UAC)");
+            return result = DeleteElevatedResult.Declined;
         }
         catch (Exception ex)
         {
-            Logger.Error("MigratePublic.DeleteElevated", ex);
-            return false;
+            Logger.Error("DeleteElevated", ex);
+            return result = DeleteElevatedResult.Error;
         }
         finally
         {
-            TryDelete(listFile);
+            // На таймауте процесс может ещё читать файлы — временные файлы не трогаем.
+            if (result != DeleteElevatedResult.TimedOut)
+            {
+                TryDelete(listFile);
+                TryDelete(scriptFile);
+            }
         }
-    }
-
-    private static void RollbackCopies(IEnumerable<string> copies)
-    {
-        foreach (var c in copies) TryDelete(c);
-    }
-
-    private static void TryDelete(string path)
-    {
-        try { if (File.Exists(path)) File.Delete(path); } catch { /* не критично */ }
     }
 
     /// <summary>Просит Проводник перечитать папки рабочего стола (иначе иконки обновятся не сразу).</summary>

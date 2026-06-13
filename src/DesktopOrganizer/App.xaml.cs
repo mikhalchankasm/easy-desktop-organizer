@@ -98,23 +98,32 @@ public partial class App : Application
 
     private void RunRestoreHiddenAndExit()
     {
+        var failed = 0;
         try
         {
             using var db = new Db();
             var hidden = db.GetHiddenItems();
             foreach (var it in hidden)
             {
-                DesktopIconService.Restore(it.FullPath, it.AddedAttributes);
-                db.SetItemHidden(it.Id, false, 0);
+                var res = DesktopIconService.Restore(it.FullPath, it.AddedAttributes);
+                if (res == RestoreResult.Failed)
+                {
+                    // Не удалось вернуть — НЕ сбрасываем флаг, чтобы не потерять путь из recovery-списка.
+                    failed++;
+                    Logger.Log($"--restore-hidden: не удалось вернуть {it.FullPath}");
+                    continue;
+                }
+                db.SetItemHidden(it.Id, false, 0); // Restored или FileGone — запись можно очистить
             }
             if (hidden.Count > 0) DesktopIconService.RefreshDesktop();
-            Logger.Log($"--restore-hidden: восстановлено {hidden.Count} элементов");
+            Logger.Log($"--restore-hidden: обработано {hidden.Count}, не удалось {failed}");
         }
         catch (Exception ex)
         {
             Logger.Error("RestoreHidden", ex);
+            failed = -1;
         }
-        Shutdown();
+        Shutdown(failed == 0 ? 0 : 1); // ненулевой код, если что-то не восстановилось
     }
 
     private void OnUnhandledException(object sender, DispatcherUnhandledExceptionEventArgs e)
@@ -305,23 +314,62 @@ public partial class App : Application
             "Общие ярлыки", MessageBoxButton.YesNo, MessageBoxImage.Question);
         if (answer != MessageBoxResult.Yes) return;
 
-        var migrated = DesktopIconService.MigratePublicItemsToUserDesktop(denied);
-        foreach (var it in migrated)
+        // Двухфазно: сначала копия и запись нового пути в БД (копия уже существует, оригинал ещё тоже),
+        // только потом удаление оригинала. На любом промежуточном сбое БД указывает на существующий файл.
+        var ops = DesktopIconService.CopyToUserDesktop(denied);
+        if (ops.Count == 0) return;
+
+        foreach (var op in ops)
         {
-            Db.UpdateItemPath(it.Id, it.FullPath);
-            if (DesktopIconService.Hide(it.FullPath, out var added) == HideResult.Hidden)
+            Db.UpdateItemPath(op.Item.Id, op.Dst);
+            op.Item.FullPath = op.Dst; // теперь модель и БД указывают на копию
+        }
+
+        var delResult = DesktopIconService.DeleteElevated(ops.Select(o => o.Src));
+
+        if (delResult is DesktopIconService.DeleteElevatedResult.Declined or DesktopIconService.DeleteElevatedResult.Error)
+        {
+            // Ничего не удалено — откатываемся к оригиналам, копии убираем.
+            foreach (var op in ops)
             {
-                it.HiddenByApp = true;
-                it.AddedAttributes = added;
-                Db.SetItemHidden(it.Id, true, added);
+                Db.UpdateItemPath(op.Item.Id, op.Src);
+                op.Item.FullPath = op.Src;
+                DesktopIconService.TryDelete(op.Dst);
+                RefreshBox(op.Item.BoxId);
             }
-            RefreshBox(it.BoxId);
+            DesktopIconService.RefreshDesktop();
+            return;
+        }
+
+        // Completed/TimedOut: БД уже указывает на копию (она существует) — потери данных нет даже
+        // если удаление оригинала ещё идёт (TimedOut) или не удалось для отдельного файла.
+        var migrated = 0;
+        foreach (var op in ops)
+        {
+            // Completed и оригинал всё ещё на месте → удаление именно его не прошло: вернёмся к оригиналу.
+            if (delResult == DesktopIconService.DeleteElevatedResult.Completed && System.IO.File.Exists(op.Src))
+            {
+                Db.UpdateItemPath(op.Item.Id, op.Src);
+                op.Item.FullPath = op.Src;
+                DesktopIconService.TryDelete(op.Dst);
+                RefreshBox(op.Item.BoxId);
+                continue;
+            }
+
+            if (DesktopIconService.Hide(op.Dst, out var added) == HideResult.Hidden)
+            {
+                op.Item.HiddenByApp = true;
+                op.Item.AddedAttributes = added;
+                Db.SetItemHidden(op.Item.Id, true, added);
+            }
+            RefreshBox(op.Item.BoxId);
+            migrated++;
         }
         DesktopIconService.RefreshDesktop();
 
-        if (migrated.Count < denied.Count)
+        if (migrated < denied.Count)
             MessageBox.Show(
-                $"Перенесено {migrated.Count} из {denied.Count} ярлыков. Подробности в логе.",
+                $"Перенесено {migrated} из {denied.Count} ярлыков. Подробности в логе.",
                 "Общие ярлыки", MessageBoxButton.OK, MessageBoxImage.Warning);
     }
 

@@ -554,10 +554,19 @@ public partial class BoxWindow : Window
                 switch (DesktopIconService.Hide(path, out var added))
                 {
                     case HideResult.Hidden:
-                        existing.HiddenByApp = true;
-                        existing.AddedAttributes = added;
-                        App.Db.SetItemHidden(existing.Id, true, added);
-                        DesktopIconService.RefreshDesktop();
+                        // recovery-состояние пишем сразу после скрытия; при сбое — компенсация.
+                        try
+                        {
+                            App.Db.SetItemHidden(existing.Id, true, added);
+                            existing.HiddenByApp = true;
+                            existing.AddedAttributes = added;
+                            DesktopIconService.RefreshDesktop();
+                        }
+                        catch (Exception ex)
+                        {
+                            Logger.Error("AddItem.SetItemHidden(existing)", ex);
+                            DesktopIconService.Restore(path, added); // не оставляем «осиротевший» скрытый файл
+                        }
                         break;
                     case HideResult.AccessDenied:
                         return (existing, true);
@@ -569,18 +578,29 @@ public partial class BoxWindow : Window
         var item = AutoSortService.CreateItemFromPath(path, Box.Id);
         item.DisplayOrder = Items.Count;
 
-        // Элемент с рабочего стола «переезжает» в коробку: скрываем его иконку на столе.
-        // Файл физически остается на месте; при удалении из коробки или выходе из
-        // приложения иконка возвращается.
+        // Сначала создаём строку в БД (как НЕ скрытую) — чтобы файл не оказался скрытым
+        // без recovery-записи, если вставка упадёт.
+        App.Db.InsertItem(item);
+
+        // Затем «переезд»: скрываем иконку на столе (файл физически на месте) и фиксируем биты.
         var publicDenied = false;
         if (DesktopIconService.IsOnDesktop(path))
         {
             switch (DesktopIconService.Hide(path, out var added))
             {
                 case HideResult.Hidden:
-                    item.HiddenByApp = true;
-                    item.AddedAttributes = added;
-                    DesktopIconService.RefreshDesktop();
+                    try
+                    {
+                        App.Db.SetItemHidden(item.Id, true, added);
+                        item.HiddenByApp = true;
+                        item.AddedAttributes = added;
+                        DesktopIconService.RefreshDesktop();
+                    }
+                    catch (Exception ex)
+                    {
+                        Logger.Error("AddItem.SetItemHidden", ex);
+                        DesktopIconService.Restore(path, added); // компенсация: возвращаем файл на стол
+                    }
                     break;
                 case HideResult.AccessDenied:
                     publicDenied = true;
@@ -588,7 +608,6 @@ public partial class BoxWindow : Window
             }
         }
 
-        App.Db.InsertItem(item);
         item.Icon = IconCache.GetIcon(item.FullPath, item.ItemType == "Folder", IconPixelSize);
         Items.Add(item);
         return (item, publicDenied);
