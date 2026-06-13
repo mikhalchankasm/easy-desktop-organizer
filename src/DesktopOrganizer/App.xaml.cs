@@ -135,29 +135,32 @@ public partial class App : Application
             return -1;
         }
 
-        // Объединяем пути из журнала и из БД. Биты журнала приоритетнее; для DB-only берём
-        // AddedAttributes (журнал мог быть потерян/не засеян) — иначе файл останется скрытым.
-        var union = new Dictionary<string, (System.IO.FileAttributes Bits, long? ItemId)>(StringComparer.OrdinalIgnoreCase);
-        foreach (var kv in journalEntries) union[kv.Key] = (kv.Value, null);
-
+        // Читаем флаги БД (fallback на случай потерянного журнала). Сбой чтения — НЕ успех:
+        // union может оказаться неполным, и нельзя рапортовать «всё восстановлено».
+        var dbItems = new List<(long, string, System.IO.FileAttributes)>();
+        var dbReadOk = true;
         if (db != null)
         {
             try
             {
                 foreach (var it in db.GetHiddenItems())
-                    union[it.FullPath] = union.TryGetValue(it.FullPath, out var ex)
-                        ? (ex.Bits, it.Id)                 // журнал есть — его биты, привязываем id
-                        : (it.AddedAttributes, it.Id);     // только БД — fallback по её битам
+                    dbItems.Add((it.Id, it.FullPath, it.AddedAttributes));
             }
-            catch (Exception ex) { Logger.Error("RestoreAllHidden.GetHidden", ex); }
+            catch (Exception ex)
+            {
+                Logger.Error("RestoreAllHidden.GetHidden", ex);
+                dbReadOk = false;
+            }
         }
+
+        var plan = RestorePlanner.BuildUnion(journalEntries, dbItems);
 
         var failed = 0;
         var restoredIds = new List<long>();
-        foreach (var (path, info) in union)
+        foreach (var t in plan)
         {
-            if (DesktopIconService.Restore(path, info.Bits) == RestoreResult.Failed) { failed++; continue; }
-            if (info.ItemId is long id) restoredIds.Add(id);
+            if (DesktopIconService.Restore(t.Path, t.Bits) == RestoreResult.Failed) { failed++; continue; }
+            restoredIds.AddRange(t.ItemIds); // файл мог быть в нескольких коробках — чистим все строки
         }
 
         // Флаги БД меняем только для подтверждённо восстановленных.
@@ -167,7 +170,7 @@ public partial class App : Application
                 catch (Exception ex) { Logger.Error("RestoreAllHidden.DbSync", ex); }
 
         DesktopIconService.RefreshDesktop();
-        return failed;
+        return dbReadOk ? failed : -1; // не прочитали БД → не успех (uninstall не удалит данные)
     }
 
     private void OnUnhandledException(object sender, DispatcherUnhandledExceptionEventArgs e)

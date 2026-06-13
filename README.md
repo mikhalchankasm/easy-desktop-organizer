@@ -32,6 +32,14 @@ dotnet run --project src/DesktopOrganizer/DesktopOrganizer.csproj
 
 Требуется [.NET 8 SDK](https://dotnet.microsoft.com/download) на Windows 10/11 (x64). Главного окна нет — после запуска появляется значок в трее и коробки на рабочем столе.
 
+## Тесты
+
+```powershell
+dotnet test tests/DesktopOrganizer.Tests/DesktopOrganizer.Tests.csproj
+```
+
+Покрывают чистую логику восстановления (`RestorePlanner`): fallback из БД при пустом журнале, дедуп одного файла из нескольких коробок, отбрасывание битов вне `Hidden|System`, приоритет журнала над БД.
+
 ## Установщик
 
 ```powershell

@@ -131,6 +131,12 @@ public static class DesktopIconService
                 return RestoreResult.Failed;
             }
             var bits = lk == JournalLookup.Found ? journaled : added; // NotFound → запасной вариант из БД
+            // Защита от повреждённого источника (особенно fallback из БД): снимаем ТОЛЬКО Hidden/System,
+            // никогда произвольные атрибуты.
+            var masked = bits & HideMask;
+            if (masked != bits)
+                Logger.Log($"Restore: биты вне HideMask отброшены ({bits} → {masked}): {path}");
+            bits = masked;
 
             if (!File.Exists(path) && !Directory.Exists(path))
             {
