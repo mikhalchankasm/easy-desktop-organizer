@@ -176,32 +176,26 @@ public static class DesktopIconService
                     return RestoreResult.Failed;
                 }
             }
-            if (hadEntry)
+            if (hadEntry && !HideJournal.Remove(path))
             {
-                if (!HideJournal.Remove(path))
+                // Запись журнала не убрана — возвращаем файл в скрытое состояние, чтобы инвариант
+                // «запись в журнале ⟺ файл скрыт нами» сохранялся и повторный recovery не снял
+                // потом потенциально пользовательские биты. Считаем восстановление неуспешным.
+                Logger.Log($"Restore: журнал не очищен, возвращаем файл в скрытое состояние: {path}");
+                try
                 {
-                    // Запись журнала не убрана — возвращаем файл в скрытое состояние, чтобы инвариант
-                    // «запись в журнале ⟺ файл скрыт нами» сохранялся и повторный recovery не снял
-                    // потом потенциально пользовательские биты. Считаем восстановление неуспешным.
-                    Logger.Log($"Restore: журнал не очищен, возвращаем файл в скрытое состояние: {path}");
-                    try
+                    if (bits != 0)
                     {
-                        if (bits != 0)
-                        {
-                            var a = File.GetAttributes(path);
-                            File.SetAttributes(path, a | bits);
-                        }
+                        var a = File.GetAttributes(path);
+                        File.SetAttributes(path, a | bits);
                     }
-                    catch (Exception ex) { Logger.Error("Restore.re-hide", ex); }
-                    return RestoreResult.Failed;
                 }
+                catch (Exception ex) { Logger.Error("Restore.re-hide", ex); }
+                return RestoreResult.Failed;
             }
-            else
-            {
-                // DB-only путь: записи в журнале не было. Файл уже возвращён; если из-за гонки запись
-                // всё же появилась — убираем best-effort, но её неудача не повод откатывать restore.
-                HideJournal.Remove(path);
-            }
+            // DB-only путь (NotFound): записи в журнале не было — удалять нечего, Remove НЕ зовём.
+            // Если запись появилась после Lookup, она принадлежит более новому Hide (другой процесс/
+            // экземпляр); стереть её здесь значило бы уничтожить чужую актуальную recovery-запись.
             return RestoreResult.Restored;
         }
         catch (Exception ex)

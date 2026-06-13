@@ -131,9 +131,23 @@ public static class HideJournal
         }
     }
 
-    /// <summary>Фиксирует запись. true — ТОЛЬКО при подтверждённой записи; вызывать ДО SetAttributes.</summary>
-    public static bool Record(string path, FileAttributes added) =>
-        Mutate(map => { map[path] = added; return true; });
+    /// <summary>
+    /// Фиксирует запись. true — ТОЛЬКО при подтверждённой записи; вызывать ДО SetAttributes.
+    /// Биты маскируются до <see cref="DesktopIconService.HideMask"/> и валидируются здесь, на входе:
+    /// иначе повреждённый источник (например, seed из БД с битым AddedAttributes) мог бы записать
+    /// строку, которую потом fail-closed <see cref="TryLoad"/> забракует, сделав ВЕСЬ журнал
+    /// нечитаемым и заблокировав восстановление. Биты вне маски/нулевые → запись отклоняется.
+    /// </summary>
+    public static bool Record(string path, FileAttributes added)
+    {
+        var masked = added & DesktopIconService.HideMask;
+        if (masked == 0 || string.IsNullOrEmpty(path))
+        {
+            Logger.Log($"HideJournal.Record: биты ({added}) вне HideMask/пусты или пустой путь — запись отклонена (fail-closed): {path}");
+            return false;
+        }
+        return Mutate(map => { map[path] = masked; return true; });
+    }
 
     /// <summary>Удаляет запись. true — удаление зафиксировано (или записи не было).</summary>
     public static bool Remove(string path) =>
