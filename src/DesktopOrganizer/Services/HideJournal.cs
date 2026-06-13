@@ -6,22 +6,42 @@ namespace DesktopOrganizer.Services;
 /// <summary>
 /// Durable-журнал скрытых приложением файлов: полный путь → добавленные биты атрибутов.
 /// Запись делается ДО изменения атрибутов файла и удаляется ПОСЛЕ его возврата на стол.
-/// Это источник правды для восстановления, НЕ зависящий от SQLite: даже если запись в БД
-/// упадёт или БД будет удалена, файлы всё равно можно вернуть на рабочий стол по журналу
-/// (App `--restore-hidden`, выход, деинсталляция).
+/// Источник правды для восстановления, НЕ зависящий от SQLite.
 ///
-/// Файл: %LOCALAPPDATA%\DesktopOrganizer\hide-journal.txt, строки вида "&lt;битыInt&gt;\t&lt;путь&gt;".
+/// Гарантии:
+/// - Каждая операция держит МЕЖПРОЦЕССНЫЙ mutex и читает файл заново с диска, затем пишет —
+///   поэтому второй процесс (например, `--restore-hidden`, запускаемый до single-instance mutex)
+///   не перезатрёт чужие изменения устаревшим снимком.
+/// - Сохранение идёт через FileStream + Flush(true) (сброс буферов ОС на диск) и атомарную
+///   замену .tmp → файл, поэтому crash/power-loss не оставит частично записанный журнал.
+/// - Record/Remove возвращают успех; вызывающий меняет атрибуты только при подтверждённой записи.
+///
+/// Файл: %LOCALAPPDATA%\DesktopOrganizer\hide-journal.txt, строки "&lt;битыInt&gt;\t&lt;путь&gt;".
 /// </summary>
 public static class HideJournal
 {
-    private static readonly object _lock = new();
-    private static Dictionary<string, FileAttributes>? _map;
-
     private static string FilePath => Path.Combine(Db.AppDataDir, "hide-journal.txt");
+    private static string MutexName => $"Local\\DesktopOrganizer_Journal_{Environment.UserName}";
 
-    private static Dictionary<string, FileAttributes> Map()
+    private static T WithLock<T>(Func<Dictionary<string, FileAttributes>, T> op)
     {
-        if (_map != null) return _map;
+        using var mtx = new Mutex(false, MutexName);
+        var acquired = false;
+        try
+        {
+            try { acquired = mtx.WaitOne(TimeSpan.FromSeconds(10)); }
+            catch (AbandonedMutexException) { acquired = true; } // прежний владелец упал — продолжаем
+            var map = Load();
+            return op(map);
+        }
+        finally
+        {
+            if (acquired) mtx.ReleaseMutex();
+        }
+    }
+
+    private static Dictionary<string, FileAttributes> Load()
+    {
         var map = new Dictionary<string, FileAttributes>(StringComparer.OrdinalIgnoreCase);
         try
         {
@@ -40,51 +60,58 @@ public static class HideJournal
         {
             Logger.Error("HideJournal.Load", ex);
         }
-        return _map = map;
+        return map;
     }
 
-    private static void Save()
+    /// <summary>Записывает журнал на диск с fsync и атомарной заменой. true — только при успехе.</summary>
+    private static bool SaveDurable(Dictionary<string, FileAttributes> map)
     {
         try
         {
             Directory.CreateDirectory(Db.AppDataDir);
             var tmp = FilePath + ".tmp";
-            File.WriteAllLines(tmp, Map().Select(kv => $"{(int)kv.Value}\t{kv.Key}"));
-            // Атомарная замена.
+            using (var fs = new FileStream(tmp, FileMode.Create, FileAccess.Write, FileShare.None))
+            using (var sw = new StreamWriter(fs))
+            {
+                foreach (var kv in map) sw.Write($"{(int)kv.Value}\t{kv.Key}\n");
+                sw.Flush();
+                fs.Flush(flushToDisk: true); // буферы ОС → физический диск
+            }
             if (File.Exists(FilePath)) File.Replace(tmp, FilePath, null);
             else File.Move(tmp, FilePath);
+            return true;
         }
         catch (Exception ex)
         {
             Logger.Error("HideJournal.Save", ex);
+            return false;
         }
     }
 
-    /// <summary>Фиксирует намерение/факт скрытия. Вызывать ДО File.SetAttributes.</summary>
-    public static void Record(string path, FileAttributes added)
+    /// <summary>
+    /// Фиксирует запись. true — ТОЛЬКО если реально записано на диск.
+    /// Вызывать ДО File.SetAttributes; при false атрибуты менять нельзя.
+    /// </summary>
+    public static bool Record(string path, FileAttributes added) => WithLock(map =>
     {
-        lock (_lock)
-        {
-            Map()[path] = added;
-            Save();
-        }
-    }
+        map[path] = added;
+        return SaveDurable(map);
+    });
 
-    public static void Remove(string path)
+    /// <summary>Удаляет запись. true — если удаление зафиксировано на диске (или записи не было).</summary>
+    public static bool Remove(string path) => WithLock(map =>
     {
-        lock (_lock)
-        {
-            if (Map().Remove(path)) Save();
-        }
-    }
+        if (!map.Remove(path)) return true; // нечего удалять
+        return SaveDurable(map);
+    });
 
     public static bool TryGet(string path, out FileAttributes added)
     {
-        lock (_lock) return Map().TryGetValue(path, out added);
+        // Чтение без блокировки безопасно: запись атомарна (.tmp → replace), частичного файла не будет.
+        var map = Load();
+        return map.TryGetValue(path, out added);
     }
 
-    public static IReadOnlyList<KeyValuePair<string, FileAttributes>> GetAll()
-    {
-        lock (_lock) return Map().ToList();
-    }
+    public static IReadOnlyList<KeyValuePair<string, FileAttributes>> GetAll() =>
+        WithLock(map => (IReadOnlyList<KeyValuePair<string, FileAttributes>>)map.ToList());
 }

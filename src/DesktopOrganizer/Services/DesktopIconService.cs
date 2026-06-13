@@ -83,8 +83,13 @@ public static class DesktopIconService
             var toAdd = HideMask & ~attrs;
             if (toAdd == 0) return HideResult.AlreadyHidden; // уже скрыт — не трогаем чужие биты
 
-            // Durable-запись ДО мутации: даже при крахе/сбое БД файл будет найден и возвращён.
-            HideJournal.Record(path, toAdd);
+            // Durable-запись ДО мутации. Если журнал не записан на диск — НЕ скрываем файл,
+            // иначе при падении до OnExit получится «осиротевший» скрытый файл без recovery-записи.
+            if (!HideJournal.Record(path, toAdd))
+            {
+                Logger.Log($"Hide: журнал не записан, атрибуты не меняем: {path}");
+                return HideResult.Error;
+            }
             try
             {
                 File.SetAttributes(path, attrs | toAdd);
@@ -128,7 +133,10 @@ public static class DesktopIconService
                 var attrs = File.GetAttributes(path);
                 File.SetAttributes(path, attrs & ~bits);
             }
-            HideJournal.Remove(path);
+            // Атрибуты сняты — это успех. Если запись журнала не удалилась, повторный проход
+            // снимет ровно эти же биты (no-op для уже снятых) и само-исправится при следующем Hide.
+            if (!HideJournal.Remove(path))
+                Logger.Log($"Restore: запись журнала не удалена (само-исправится): {path}");
             return RestoreResult.Restored;
         }
         catch (Exception ex)
