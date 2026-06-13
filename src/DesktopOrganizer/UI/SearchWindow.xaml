@@ -1,0 +1,37 @@
+<Window x:Class="DesktopOrganizer.UI.SearchWindow"
+        xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        Title="Поиск"
+        Width="560" SizeToContent="Height" MaxHeight="480"
+        WindowStyle="None" AllowsTransparency="True" Background="Transparent"
+        ShowInTaskbar="False" Topmost="True"
+        Deactivated="Window_Deactivated"
+        PreviewKeyDown="Window_PreviewKeyDown">
+    <Border CornerRadius="10" Background="#F21E242C" BorderBrush="#50FFFFFF" BorderThickness="1" Padding="10">
+        <StackPanel>
+            <TextBox x:Name="QueryBox" FontSize="16" Padding="8"
+                     Background="#33000000" Foreground="White" BorderThickness="0"
+                     CaretBrush="White"
+                     TextChanged="QueryBox_TextChanged"/>
+            <ListBox x:Name="ResultsList" MaxHeight="380" Margin="0,8,0,0"
+                     Background="Transparent" BorderThickness="0"
+                     ScrollViewer.HorizontalScrollBarVisibility="Disabled"
+                     MouseDoubleClick="ResultsList_MouseDoubleClick">
+                <ListBox.ItemTemplate>
+                    <DataTemplate>
+                        <DockPanel Margin="2">
+                            <Image Source="{Binding Icon}" Width="20" Height="20" Margin="0,0,8,0"/>
+                            <TextBlock DockPanel.Dock="Right" Text="{Binding BoxName}"
+                                       Foreground="#88FFFFFF" FontSize="11" VerticalAlignment="Center" Margin="8,0,0,0"/>
+                            <StackPanel>
+                                <TextBlock Text="{Binding Name}" Foreground="White" FontSize="13"/>
+                                <TextBlock Text="{Binding FullPath}" Foreground="#88FFFFFF" FontSize="10"
+                                           TextTrimming="CharacterEllipsis"/>
+                            </StackPanel>
+                        </DockPanel>
+                    </DataTemplate>
+                </ListBox.ItemTemplate>
+            </ListBox>
+        </StackPanel>
+    </Border>
+</Window>

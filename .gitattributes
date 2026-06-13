@@ -1,0 +1,14 @@
+# Нормализация переводов строк
+* text=auto
+
+*.cs    text diff=csharp
+*.xaml  text
+*.csproj text
+*.manifest text
+*.md    text
+*.iss   text
+*.ps1   text
+
+# Бинарные файлы
+*.ico   binary
+*.png   binary
