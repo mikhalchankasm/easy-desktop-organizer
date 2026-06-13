@@ -133,10 +133,23 @@ public static class DesktopIconService
                 var attrs = File.GetAttributes(path);
                 File.SetAttributes(path, attrs & ~bits);
             }
-            // Атрибуты сняты — это успех. Если запись журнала не удалилась, повторный проход
-            // снимет ровно эти же биты (no-op для уже снятых) и само-исправится при следующем Hide.
             if (!HideJournal.Remove(path))
-                Logger.Log($"Restore: запись журнала не удалена (само-исправится): {path}");
+            {
+                // Запись журнала не убрана — возвращаем файл в скрытое состояние, чтобы инвариант
+                // «запись в журнале ⟺ файл скрыт нами» сохранялся и повторный recovery не снял
+                // потом потенциально пользовательские биты. Считаем восстановление неуспешным.
+                Logger.Log($"Restore: журнал не очищен, возвращаем файл в скрытое состояние: {path}");
+                try
+                {
+                    if (bits != 0)
+                    {
+                        var a = File.GetAttributes(path);
+                        File.SetAttributes(path, a | bits);
+                    }
+                }
+                catch (Exception ex) { Logger.Error("Restore.re-hide", ex); }
+                return RestoreResult.Failed;
+            }
             return RestoreResult.Restored;
         }
         catch (Exception ex)
