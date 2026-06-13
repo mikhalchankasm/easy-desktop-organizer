@@ -47,7 +47,7 @@ public static class DesktopIconService
     // Hidden+System: только Hidden оставляет ярлык видимым (полупрозрачным), если включён показ
     // скрытых файлов. Пара Hidden|System («защищённый файл ОС») прячет его, пока выключен
     // ShowSuperHidden (по умолчанию выключен).
-    public const FileAttributes HideMask = FileAttributes.Hidden | FileAttributes.System;
+    public const FileAttributes HideMask = HideAttributes.Mask;
 
     /// <summary>Лежит ли элемент непосредственно на рабочем столе (текущем или Public).</summary>
     public static bool IsOnDesktop(string path)
@@ -153,6 +153,23 @@ public static class DesktopIconService
             {
                 var attrs = File.GetAttributes(path);
                 File.SetAttributes(path, attrs & ~bits);
+            }
+            else
+            {
+                // Снимать нечего: либо приложение и не скрывало этот файл (он уже видим — успех),
+                // либо набор добавленных бит потерян/повреждён (журнала нет, AddedAttributes=0 в БД).
+                // Во втором случае файл всё ещё Hidden/System: мы не знаем, какие биты наши, и не
+                // вправе снимать произвольные. Не рапортуем успех — иначе вызывающий очистит флаги
+                // БД и сотрёт последний след, а деинсталлятор сочтёт восстановление успешным и
+                // предложит удалить данные. Возвращаем Failed: запись/флаг останутся до следующего раза.
+                FileAttributes cur;
+                try { cur = File.GetAttributes(path); }
+                catch (Exception ex) { Logger.Error("Restore.GetAttributes", ex); return RestoreResult.Failed; }
+                if ((cur & HideMask) != 0)
+                {
+                    Logger.Log($"Restore: добавленные биты неизвестны, но файл всё ещё скрыт — откладываем: {path}");
+                    return RestoreResult.Failed;
+                }
             }
             if (!HideJournal.Remove(path))
             {

@@ -1,12 +1,12 @@
 <Project Sdk="Microsoft.NET.Sdk">
 
+  <!-- Ссылаемся на Core (net8.0), а НЕ на WinExe: иначе dotnet test пересобирает
+       DesktopOrganizer.exe и падает, если приложение запущено (файл заблокирован). -->
   <PropertyGroup>
-    <TargetFramework>net8.0-windows</TargetFramework>
+    <TargetFramework>net8.0</TargetFramework>
     <Nullable>enable</Nullable>
     <ImplicitUsings>enable</ImplicitUsings>
     <IsPackable>false</IsPackable>
-    <UseWPF>true</UseWPF>
-    <UseWindowsForms>true</UseWindowsForms>
   </PropertyGroup>
 
   <ItemGroup>
@@ -16,7 +16,7 @@
   </ItemGroup>
 
   <ItemGroup>
-    <ProjectReference Include="..\..\src\DesktopOrganizer\DesktopOrganizer.csproj" />
+    <ProjectReference Include="..\..\src\DesktopOrganizer.Core\DesktopOrganizer.Core.csproj" />
   </ItemGroup>
 
 </Project>

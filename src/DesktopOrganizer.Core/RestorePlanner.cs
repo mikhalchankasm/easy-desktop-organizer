@@ -7,14 +7,14 @@ public sealed record RestoreTarget(string Path, FileAttributes Bits, IReadOnlyLi
 
 /// <summary>
 /// Чистая (без ввода-вывода) логика объединения источников для восстановления: durable-журнала и
-/// флагов БД. Вынесена отдельно, чтобы покрыть тестами edge-кейсы (пустой журнал + fallback из БД,
-/// один путь в нескольких коробках, мусорные биты в БД). См. tests/DesktopOrganizer.Tests.
+/// флагов БД. Вынесена в Core, чтобы покрыть тестами edge-кейсы (пустой журнал + fallback из БД,
+/// один путь в нескольких коробках, мусорные биты в БД) без сборки WinExe. См. tests/DesktopOrganizer.Tests.
 /// </summary>
 public static class RestorePlanner
 {
     /// <summary>
     /// Строит план восстановления. Биты журнала приоритетнее (он уже провалидирован при чтении);
-    /// для путей, которых в журнале нет, берутся биты из БД, отфильтрованные до <see cref="DesktopIconService.HideMask"/>.
+    /// для путей, которых в журнале нет, берутся биты из БД, отфильтрованные до <see cref="HideAttributes.Mask"/>.
     /// Все строки БД с одинаковым путём (файл в нескольких коробках) собираются в один список Id.
     /// </summary>
     public static List<RestoreTarget> BuildUnion(
@@ -24,7 +24,7 @@ public static class RestorePlanner
         var byPath = new Dictionary<string, (FileAttributes Bits, List<long> Ids)>(StringComparer.OrdinalIgnoreCase);
 
         foreach (var kv in journal)
-            byPath[kv.Key] = (kv.Value & DesktopIconService.HideMask, new List<long>());
+            byPath[kv.Key] = (kv.Value & HideAttributes.Mask, new List<long>());
 
         foreach (var it in dbItems)
         {
@@ -34,7 +34,7 @@ public static class RestorePlanner
             }
             else
             {
-                byPath[it.FullPath] = (it.Added & DesktopIconService.HideMask, new List<long> { it.Id });
+                byPath[it.FullPath] = (it.Added & HideAttributes.Mask, new List<long> { it.Id });
             }
         }
 

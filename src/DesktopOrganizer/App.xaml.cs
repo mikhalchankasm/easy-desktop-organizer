@@ -155,22 +155,28 @@ public partial class App : Application
 
         var plan = RestorePlanner.BuildUnion(journalEntries, dbItems);
 
-        var failed = 0;
-        var restoredIds = new List<long>();
+        // Файловую часть (Restore) делаем здесь; решение «что чистить / общий итог» — в чистом
+        // RecoveryPlan.Resolve (покрыто тестами).
+        var outcomes = new List<RestoreOutcome>(plan.Count);
         foreach (var t in plan)
-        {
-            if (DesktopIconService.Restore(t.Path, t.Bits) == RestoreResult.Failed) { failed++; continue; }
-            restoredIds.AddRange(t.ItemIds); // файл мог быть в нескольких коробках — чистим все строки
-        }
+            outcomes.Add(DesktopIconService.Restore(t.Path, t.Bits) switch
+            {
+                RestoreResult.Restored => RestoreOutcome.Restored,
+                RestoreResult.FileGone => RestoreOutcome.FileGone,
+                _ => RestoreOutcome.Failed,
+            });
+
+        // journalReadOk=true: сбой чтения журнала уже отсечён ранним возвратом -1 выше.
+        var decision = RecoveryPlan.Resolve(plan, outcomes, journalReadOk: true, dbReadOk: dbReadOk);
 
         // Флаги БД меняем только для подтверждённо восстановленных.
         if (db != null)
-            foreach (var id in restoredIds)
+            foreach (var id in decision.ClearedIds)
                 try { db.SetItemHidden(id, keepMembership, 0); }
                 catch (Exception ex) { Logger.Error("RestoreAllHidden.DbSync", ex); }
 
         DesktopIconService.RefreshDesktop();
-        return dbReadOk ? failed : -1; // не прочитали БД → не успех (uninstall не удалит данные)
+        return decision.Failed; // -1 если БД прочитана не полностью (uninstall не удалит данные)
     }
 
     private void OnUnhandledException(object sender, DispatcherUnhandledExceptionEventArgs e)

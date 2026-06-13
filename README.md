@@ -38,7 +38,12 @@ dotnet run --project src/DesktopOrganizer/DesktopOrganizer.csproj
 dotnet test tests/DesktopOrganizer.Tests/DesktopOrganizer.Tests.csproj
 ```
 
-Покрывают чистую логику восстановления (`RestorePlanner`): fallback из БД при пустом журнале, дедуп одного файла из нескольких коробок, отбрасывание битов вне `Hidden|System`, приоритет журнала над БД.
+Тесты ссылаются на отдельную сборку **`DesktopOrganizer.Core`** (`net8.0`, без WPF/Win32), поэтому `dotnet test` не пересобирает `DesktopOrganizer.exe` и проходит даже при запущенном приложении.
+
+Покрывают чистую логику восстановления:
+
+- **`RestorePlanner`** (объединение журнала и БД): fallback из БД при пустом журнале, дедуп одного файла из нескольких коробок, отбрасывание битов вне `Hidden|System`, приоритет журнала над БД, проброс `AddedAttributes=0`.
+- **`RecoveryPlan`** (политика результата): флаги БД чистятся только для восстановленных (`Restored`/`FileGone`), `-1` при неполном чтении журнала или БД (деинсталлятор не сотрёт данные), восстановленное по журналу помечается даже при сбое чтения БД.
 
 ## Установщик
 
@@ -82,12 +87,14 @@ iscc installer/DesktopOrganizer.iss   # требуется Inno Setup 6
 ## Структура проекта
 
 ```
-src/DesktopOrganizer/   — приложение (WPF)
-  Data/                 — слой SQLite
-  Models/               — модели данных
-  Services/             — иконки, горячие клавиши, автозапуск, автосортировка, хуки рабочего стола
-  UI/                   — окна коробки, поиска, настроек, оверлей выравнивания
-installer/              — скрипт Inno Setup
+src/DesktopOrganizer/      — приложение (WPF)
+  Data/                    — слой SQLite
+  Models/                  — модели данных
+  Services/                — иконки, горячие клавиши, автозапуск, автосортировка, хуки рабочего стола
+  UI/                      — окна коробки, поиска, настроек, оверлей выравнивания
+src/DesktopOrganizer.Core/ — чистая логика восстановления (RestorePlanner, RecoveryPlan, HideAttributes), без Win32/WPF
+tests/DesktopOrganizer.Tests/ — xUnit поверх Core
+installer/                 — скрипт Inno Setup
 tools/                  — генератор иконки приложения
 docs/TZ.md              — техническое задание (RU)
 ```

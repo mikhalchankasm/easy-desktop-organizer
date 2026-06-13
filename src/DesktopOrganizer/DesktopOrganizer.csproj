@@ -20,6 +20,12 @@
     <PackageReference Include="Microsoft.Data.Sqlite" Version="8.0.4" />
   </ItemGroup>
 
+  <!-- Чистая логика восстановления (RestorePlanner/RecoveryPlan/HideAttributes) живёт в Core,
+       чтобы её могли тестировать без сборки этого WinExe. -->
+  <ItemGroup>
+    <ProjectReference Include="..\DesktopOrganizer.Core\DesktopOrganizer.Core.csproj" />
+  </ItemGroup>
+
   <!-- WinForms нужен только для NotifyIcon в трее: убираем его implicit usings, чтобы не конфликтовать с WPF. -->
   <ItemGroup>
     <Using Remove="System.Windows.Forms" />

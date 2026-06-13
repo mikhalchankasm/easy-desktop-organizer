@@ -75,6 +75,18 @@ public class RestorePlannerTests
     }
 
     [Fact]
+    public void DbAddedZero_ProducesZeroBitsTarget()
+    {
+        // AddedAttributes=0 в БД (потеря/повреждение) → Bits=0. План это пропускает как есть;
+        // защиту «файл всё ещё скрыт → Failed» обеспечивает DesktopIconService.Restore.
+        var plan = RestorePlanner.BuildUnion(
+            Journal(),
+            new[] { (1L, @"C:\d\a.lnk", (FileAttributes)0) });
+
+        Assert.Equal((FileAttributes)0, Assert.Single(plan).Bits);
+    }
+
+    [Fact]
     public void PathMatch_IsCaseInsensitive()
     {
         var plan = RestorePlanner.BuildUnion(

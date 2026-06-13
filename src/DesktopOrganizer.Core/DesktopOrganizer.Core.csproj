@@ -1,0 +1,11 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!-- Чистая логика восстановления без Win32/WPF: net8.0 (не -windows), чтобы тесты
+       никогда не собирали и не блокировали запущенный DesktopOrganizer.exe. -->
+  <PropertyGroup>
+    <TargetFramework>net8.0</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+  </PropertyGroup>
+
+</Project>
