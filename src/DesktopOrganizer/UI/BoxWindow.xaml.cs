@@ -128,12 +128,35 @@ public partial class BoxWindow : Window
     private bool TryGetWorkAreaPhysical(out RECT work)
     {
         work = default;
-        var mon = MonitorFromWindow(_hwnd, MONITOR_DEFAULTTONEAREST);
-        if (mon == IntPtr.Zero) return false;
-        var mi = new MONITORINFO { cbSize = Marshal.SizeOf<MONITORINFO>() };
-        if (!GetMonitorInfo(mon, ref mi)) return false;
+        if (!TryGetMonitorInfo(out var mi)) return false;
         work = mi.rcWork;
         return true;
+    }
+
+    /// <summary>Полные границы монитора под окном в ФИЗИЧЕСКИХ пикселях (для оверлея направляющих).</summary>
+    private bool TryGetMonitorBoundsPhysical(out RECT bounds)
+    {
+        bounds = default;
+        if (!TryGetMonitorInfo(out var mi)) return false;
+        bounds = mi.rcMonitor;
+        return true;
+    }
+
+    private bool TryGetMonitorInfo(out MONITORINFO mi)
+    {
+        mi = new MONITORINFO { cbSize = Marshal.SizeOf<MONITORINFO>() };
+        var mon = MonitorFromWindow(_hwnd, MONITOR_DEFAULTTONEAREST);
+        return mon != IntPtr.Zero && GetMonitorInfo(mon, ref mi);
+    }
+
+    /// <summary>Показывает направляющие через общий оверлей, спозиционированный на текущий монитор.</summary>
+    private void ShowGuides(int? guideX, int? guideY)
+    {
+        if (guideX == null && guideY == null) { OwnerApp.Overlay.HideGuides(); return; }
+        if (!TryGetMonitorBoundsPhysical(out var mon)) { OwnerApp.Overlay.HideGuides(); return; }
+        var dpi = VisualTreeHelper.GetDpi(this);
+        OwnerApp.Overlay.ShowGuides(mon.L, mon.T, mon.R - mon.L, mon.B - mon.T,
+            dpi.DpiScaleX, dpi.DpiScaleY, guideX, guideY);
     }
 
     private void OnSourceInitialized(object? sender, EventArgs e)
@@ -172,8 +195,7 @@ public partial class BoxWindow : Window
             SnapToNeighbors(ref r, out var guideX, out var guideY);
             Marshal.StructureToPtr(r, lParam, false);
 
-            // Координаты направляющих — физические пиксели; оверлей переведёт по своему DPI.
-            OwnerApp.Overlay.ShowGuidesPhysical(guideX, guideY);
+            ShowGuides(guideX, guideY);
 
             handled = true;
             return new IntPtr(1);
@@ -185,8 +207,7 @@ public partial class BoxWindow : Window
             SnapResize(ref r, wParam.ToInt32(), out var guideX, out var guideY);
             Marshal.StructureToPtr(r, lParam, false);
 
-            // Координаты направляющих — физические пиксели; оверлей переведёт по своему DPI.
-            OwnerApp.Overlay.ShowGuidesPhysical(guideX, guideY);
+            ShowGuides(guideX, guideY);
 
             handled = true;
             return new IntPtr(1);
@@ -620,21 +641,18 @@ public partial class BoxWindow : Window
     /// </summary>
     private void CompensateFailedHide(BoxItem item, string path, System.IO.FileAttributes added)
     {
+        // Запись в БД не удалась, но файл уже в durable-журнале — он будет возвращён на стол
+        // по журналу при выходе/следующем старте даже при полном отказе БД. Пытаемся вернуть сразу.
         if (DesktopIconService.Restore(path, added) != RestoreResult.Failed)
         {
             item.HiddenByApp = false;
             item.AddedAttributes = 0;
-            return;
         }
-        try
+        else
         {
-            App.Db.SetItemHidden(item.Id, true, added);
             item.HiddenByApp = true;
             item.AddedAttributes = added;
-        }
-        catch (Exception ex)
-        {
-            Logger.Error("CompensateFailedHide: скрытый файл без recovery-записи!", ex);
+            Logger.Log($"CompensateFailedHide: {path} остался скрытым, восстановится по журналу");
         }
     }
 
@@ -750,11 +768,9 @@ public partial class BoxWindow : Window
         try
         {
             // Снимаем наши атрибуты, чтобы в корзине/после удаления не осталось «скрытого+системного».
+            // preRestored=true только если атрибуты ДЕЙСТВИТЕЛЬНО сняты (иначе файл и так остался скрытым).
             if (item.HiddenByApp)
-            {
-                DesktopIconService.Restore(item.FullPath, item.AddedAttributes);
-                preRestored = true;
-            }
+                preRestored = DesktopIconService.Restore(item.FullPath, item.AddedAttributes) == RestoreResult.Restored;
 
             if (isReparse)
             {

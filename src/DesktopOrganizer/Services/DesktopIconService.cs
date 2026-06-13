@@ -82,9 +82,20 @@ public static class DesktopIconService
             var attrs = File.GetAttributes(path);
             var toAdd = HideMask & ~attrs;
             if (toAdd == 0) return HideResult.AlreadyHidden; // уже скрыт — не трогаем чужие биты
-            File.SetAttributes(path, attrs | toAdd);
-            added = toAdd;
-            return HideResult.Hidden;
+
+            // Durable-запись ДО мутации: даже при крахе/сбое БД файл будет найден и возвращён.
+            HideJournal.Record(path, toAdd);
+            try
+            {
+                File.SetAttributes(path, attrs | toAdd);
+                added = toAdd;
+                return HideResult.Hidden;
+            }
+            catch
+            {
+                HideJournal.Remove(path); // не применили — снимаем запись из журнала
+                throw;
+            }
         }
         catch (UnauthorizedAccessException)
         {
@@ -98,24 +109,45 @@ public static class DesktopIconService
         }
     }
 
-    /// <summary>Возвращает элемент на стол, снимая РОВНО те биты, что поставило приложение.</summary>
+    /// <summary>
+    /// Возвращает элемент на стол, снимая РОВНО те биты, что поставило приложение.
+    /// Журнал авторитетнее переданного <paramref name="added"/> (тот мог устареть в БД).
+    /// </summary>
     public static RestoreResult Restore(string path, FileAttributes added)
     {
         try
         {
-            if (!File.Exists(path) && !Directory.Exists(path)) return RestoreResult.FileGone;
-            if (added != 0)
+            var bits = HideJournal.TryGet(path, out var journaled) ? journaled : added;
+            if (!File.Exists(path) && !Directory.Exists(path))
+            {
+                HideJournal.Remove(path);
+                return RestoreResult.FileGone;
+            }
+            if (bits != 0)
             {
                 var attrs = File.GetAttributes(path);
-                File.SetAttributes(path, attrs & ~added);
+                File.SetAttributes(path, attrs & ~bits);
             }
+            HideJournal.Remove(path);
             return RestoreResult.Restored;
         }
         catch (Exception ex)
         {
             Logger.Error("DesktopIcon.Restore", ex);
-            return RestoreResult.Failed;
+            return RestoreResult.Failed; // запись остаётся в журнале — восстановим позже
         }
+    }
+
+    /// <summary>
+    /// Возвращает на стол ВСЕ файлы из durable-журнала (источник правды, не зависит от БД).
+    /// Используется на выходе, в recovery-режиме и деинсталляторе. Возвращает число неудач.
+    /// </summary>
+    public static int RestoreAllFromJournal()
+    {
+        var failed = 0;
+        foreach (var kv in HideJournal.GetAll())
+            if (Restore(kv.Key, kv.Value) == RestoreResult.Failed) failed++;
+        return failed;
     }
 
     /// <summary>Скопированный на личный стол элемент: модель, исходный (Public) путь, путь копии.</summary>

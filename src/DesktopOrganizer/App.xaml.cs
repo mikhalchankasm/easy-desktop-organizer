@@ -82,15 +82,22 @@ public partial class App : Application
         var any = false;
         foreach (var it in hidden)
         {
+            // Hide сам пишет durable-журнал ДО мутации, поэтому даже если запись в БД ниже
+            // упадёт, файл будет возвращён по журналу — отдельная компенсация не нужна.
             var outcome = DesktopIconService.Hide(it.FullPath, out var added);
             if (outcome == HideResult.Hidden)
             {
-                Db.SetItemHidden(it.Id, true, added);
+                try { Db.SetItemHidden(it.Id, true, added); }
+                catch (Exception ex) { Logger.Error("RehideOnStartup.persist", ex); }
                 any = true;
             }
             else if (outcome == HideResult.AlreadyHidden)
             {
-                any = true; // уже скрыт (после сбоя) — сохранённые биты оставляем
+                // Файл уже скрыт. Засеваем журнал из БД, если его там нет — миграция со старых
+                // версий (журнала не было) или после сбоя, иначе OnExit не вернёт файл на стол.
+                if (!HideJournal.TryGet(it.FullPath, out _) && it.AddedAttributes != 0)
+                    HideJournal.Record(it.FullPath, it.AddedAttributes);
+                any = true;
             }
         }
         if (any) DesktopIconService.RefreshDesktop();
@@ -101,22 +108,21 @@ public partial class App : Application
         var failed = 0;
         try
         {
-            using var db = new Db();
-            var hidden = db.GetHiddenItems();
-            foreach (var it in hidden)
+            // Источник правды — durable-журнал (работает даже если БД повреждена/отсутствует).
+            failed = DesktopIconService.RestoreAllFromJournal();
+            DesktopIconService.RefreshDesktop();
+
+            // Best-effort: чистим флаги в БД для тех, кого реально вернули (нет в журнале).
+            try
             {
-                var res = DesktopIconService.Restore(it.FullPath, it.AddedAttributes);
-                if (res == RestoreResult.Failed)
-                {
-                    // Не удалось вернуть — НЕ сбрасываем флаг, чтобы не потерять путь из recovery-списка.
-                    failed++;
-                    Logger.Log($"--restore-hidden: не удалось вернуть {it.FullPath}");
-                    continue;
-                }
-                db.SetItemHidden(it.Id, false, 0); // Restored или FileGone — запись можно очистить
+                using var db = new Db();
+                foreach (var it in db.GetHiddenItems())
+                    if (!HideJournal.TryGet(it.FullPath, out _))
+                        try { db.SetItemHidden(it.Id, false, 0); } catch { /* не критично */ }
             }
-            if (hidden.Count > 0) DesktopIconService.RefreshDesktop();
-            Logger.Log($"--restore-hidden: обработано {hidden.Count}, не удалось {failed}");
+            catch (Exception ex) { Logger.Error("RestoreHidden.DbSync", ex); }
+
+            Logger.Log($"--restore-hidden: не удалось вернуть {failed}");
         }
         catch (Exception ex)
         {
@@ -137,25 +143,28 @@ public partial class App : Application
         // Каждый шаг защищён отдельно: возврат файлов на стол не должен срываться
         // из-за ошибки сохранения геометрии или освобождения ресурсов (раздел 6.2 ТЗ).
 
-        // 1. Возврат скрытых ярлыков на рабочий стол — самое важное, делаем первым.
-        // Db может быть null, если это был второй экземпляр / recovery и мы вышли досрочно.
+        // 1. Возврат скрытых ярлыков — по durable-журналу. Не зависит от БД и не прерывается
+        // её сбоями: один проблемный элемент не мешает восстановить остальные.
+        try
+        {
+            var failed = DesktopIconService.RestoreAllFromJournal();
+            DesktopIconService.RefreshDesktop();
+            if (failed > 0)
+                Logger.Log($"OnExit: {failed} файлов не возвращены (останутся в журнале до следующего запуска)");
+        }
+        catch (Exception ex) { Logger.Error("OnExit.Restore", ex); }
+
+        // 1b. Best-effort синхронизация БД: членство в коробке сохраняем, применённые биты обнуляем.
+        // Каждый элемент отдельно — сбой одного не прерывает остальные.
         if (Db != null)
         {
             try
             {
-                var hidden = Db.GetHiddenItems();
-                foreach (var it in hidden)
-                {
-                    var res = DesktopIconService.Restore(it.FullPath, it.AddedAttributes);
-                    // Восстановили (или файла нет) — членство в коробке сохраняем (HiddenByApp=true),
-                    // но «применённые нами биты» обнуляем: иначе если пользователь сам скроет файл,
-                    // пока программа выключена, следующий выход снимет уже его атрибуты.
-                    if (res != RestoreResult.Failed)
-                        Db.SetItemHidden(it.Id, true, 0);
-                }
-                if (hidden.Count > 0) DesktopIconService.RefreshDesktop();
+                foreach (var it in Db.GetHiddenItems())
+                    try { Db.SetItemHidden(it.Id, true, 0); }
+                    catch (Exception ex) { Logger.Error("OnExit.DbSync.item", ex); }
             }
-            catch (Exception ex) { Logger.Error("OnExit.Restore", ex); }
+            catch (Exception ex) { Logger.Error("OnExit.DbSync", ex); }
         }
 
         // 2. Сохранение геометрии коробок.
