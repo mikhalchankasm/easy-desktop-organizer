@@ -565,7 +565,7 @@ public partial class BoxWindow : Window
                         catch (Exception ex)
                         {
                             Logger.Error("AddItem.SetItemHidden(existing)", ex);
-                            DesktopIconService.Restore(path, added); // не оставляем «осиротевший» скрытый файл
+                            CompensateFailedHide(existing, path, added);
                         }
                         break;
                     case HideResult.AccessDenied:
@@ -599,7 +599,7 @@ public partial class BoxWindow : Window
                     catch (Exception ex)
                     {
                         Logger.Error("AddItem.SetItemHidden", ex);
-                        DesktopIconService.Restore(path, added); // компенсация: возвращаем файл на стол
+                        CompensateFailedHide(item, path, added);
                     }
                     break;
                 case HideResult.AccessDenied:
@@ -611,6 +611,31 @@ public partial class BoxWindow : Window
         item.Icon = IconCache.GetIcon(item.FullPath, item.ItemType == "Folder", IconPixelSize);
         Items.Add(item);
         return (item, publicDenied);
+    }
+
+    /// <summary>
+    /// Запись recovery-состояния после Hide не удалась. Пытаемся вернуть файл на стол;
+    /// если и это не вышло — файл остаётся скрытым, поэтому помечаем элемент HiddenByApp,
+    /// чтобы его нашёл recovery-проход (старт/выход/деинсталляция) и не было «осиротевшего» файла.
+    /// </summary>
+    private void CompensateFailedHide(BoxItem item, string path, System.IO.FileAttributes added)
+    {
+        if (DesktopIconService.Restore(path, added) != RestoreResult.Failed)
+        {
+            item.HiddenByApp = false;
+            item.AddedAttributes = 0;
+            return;
+        }
+        try
+        {
+            App.Db.SetItemHidden(item.Id, true, added);
+            item.HiddenByApp = true;
+            item.AddedAttributes = added;
+        }
+        catch (Exception ex)
+        {
+            Logger.Error("CompensateFailedHide: скрытый файл без recovery-записи!", ex);
+        }
     }
 
     /// <summary>Записывает текущий порядок элементов коллекции в DisplayOrder.</summary>
@@ -721,10 +746,15 @@ public partial class BoxWindow : Window
             MessageBoxButton.YesNo, MessageBoxImage.Warning, MessageBoxResult.No);
         if (answer != MessageBoxResult.Yes) return;
 
+        var preRestored = false;
         try
         {
             // Снимаем наши атрибуты, чтобы в корзине/после удаления не осталось «скрытого+системного».
-            if (item.HiddenByApp) DesktopIconService.Restore(item.FullPath, item.AddedAttributes);
+            if (item.HiddenByApp)
+            {
+                DesktopIconService.Restore(item.FullPath, item.AddedAttributes);
+                preRestored = true;
+            }
 
             if (isReparse)
             {
@@ -750,6 +780,20 @@ public partial class BoxWindow : Window
         catch (Exception ex)
         {
             Logger.Error("DeleteItemFile", ex);
+
+            // Удаление не удалось, но атрибуты уже сняты — возвращаем «скрытое» состояние,
+            // чтобы элемент остался согласованным (он по-прежнему в коробке).
+            if (preRestored && (File.Exists(item.FullPath) || Directory.Exists(item.FullPath)))
+            {
+                if (DesktopIconService.Hide(item.FullPath, out var added) == HideResult.Hidden)
+                {
+                    item.AddedAttributes = added;
+                    try { App.Db.SetItemHidden(item.Id, true, added); }
+                    catch (Exception ex2) { Logger.Error("DeleteItemFile.re-hide persist", ex2); }
+                }
+                DesktopIconService.RefreshDesktop();
+            }
+
             MessageBox.Show($"Не удалось удалить файл:\n{ex.Message}", "Desktop Organizer",
                 MessageBoxButton.OK, MessageBoxImage.Error);
         }

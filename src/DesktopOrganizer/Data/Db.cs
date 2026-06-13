@@ -74,10 +74,14 @@ public sealed class Db : IDisposable
         {
             // Какие биты атрибутов (Hidden=2, System=4) поставило приложение — чтобы при
             // возврате снять РОВНО их и не испортить исходные атрибуты пользователя.
-            Exec("ALTER TABLE Items ADD COLUMN AddedAttributes INTEGER NOT NULL DEFAULT 0");
-            // Legacy: старые версии всегда ставили Hidden|System (=6). Записываем это
-            // одноразово для уже скрытых элементов, иначе их нечем будет «развидеть».
-            Exec("UPDATE Items SET AddedAttributes=6 WHERE HiddenByApp=1 AND AddedAttributes=0");
+            // ALTER + backfill в одной транзакции: при сбое посередине откатывается целиком,
+            // и миграция повторится при следующем запуске (колонка не останется без backfill).
+            RunInTransaction(() =>
+            {
+                Exec("ALTER TABLE Items ADD COLUMN AddedAttributes INTEGER NOT NULL DEFAULT 0");
+                // Legacy: старые версии всегда ставили Hidden|System (=6).
+                Exec("UPDATE Items SET AddedAttributes=6 WHERE HiddenByApp=1 AND AddedAttributes=0");
+            });
         }
     }
 

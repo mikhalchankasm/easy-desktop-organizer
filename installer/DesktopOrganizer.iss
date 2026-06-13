@@ -46,24 +46,41 @@ Root: HKCU; Subkey: "Software\Microsoft\Windows\CurrentVersion\Run"; ValueType: 
 [Run]
 Filename: "{app}\{#MyAppExeName}"; Description: "Запустить {#MyAppName}"; Flags: nowait postinstall skipifsilent
 
-[UninstallRun]
-; Останавливаем приложение перед удалением
-Filename: "{cmd}"; Parameters: "/C taskkill /IM {#MyAppExeName} /F"; Flags: runhidden; RunOnceId: "KillApp"
-; Возвращаем все скрытые ярлыки на рабочий стол, чтобы после удаления программы
-; пользователь не потерял к ним доступ.
-Filename: "{app}\{#MyAppExeName}"; Parameters: "--restore-hidden"; Flags: runhidden waituntilterminated; RunOnceId: "RestoreHidden"
-
 [Code]
-// При полном удалении спрашиваем, удалять ли пользовательские данные (настройки/БД сохраняются по умолчанию — раздел 13 ТЗ).
+var
+  RestoreHadErrors: Boolean;
+
+// usUninstall вызывается ДО удаления файлов: exe и БД ещё на месте — останавливаем
+// приложение и возвращаем скрытые ярлыки на рабочий стол, фиксируя результат.
+// usPostUninstall — предлагаем удалить данные ТОЛЬКО если восстановление прошло без ошибок
+// (иначе можно потерять recovery-список оставшихся скрытых файлов).
 procedure CurUninstallStepChanged(CurUninstallStep: TUninstallStep);
 var
+  ResultCode: Integer;
   DataDir: string;
 begin
-  if CurUninstallStep = usPostUninstall then
+  if CurUninstallStep = usUninstall then
+  begin
+    Exec(ExpandConstant('{cmd}'), '/C taskkill /IM {#MyAppExeName} /F', '',
+      SW_HIDE, ewWaitUntilTerminated, ResultCode);
+    RestoreHadErrors := True;
+    if Exec(ExpandConstant('{app}\{#MyAppExeName}'), '--restore-hidden', '',
+         SW_HIDE, ewWaitUntilTerminated, ResultCode) then
+      RestoreHadErrors := (ResultCode <> 0);
+  end
+  else if CurUninstallStep = usPostUninstall then
   begin
     DataDir := ExpandConstant('{localappdata}\DesktopOrganizer');
     if DirExists(DataDir) then
-      if MsgBox('Удалить также настройки и базу данных Desktop Organizer?', mbConfirmation, MB_YESNO) = IDYES then
+    begin
+      if RestoreHadErrors then
+        MsgBox('Некоторые ярлыки не удалось вернуть на рабочий стол.' + #13#10 +
+               'Папка данных оставлена, чтобы не потерять список для восстановления.' + #13#10 +
+               'Снимите атрибут «скрытый» с нужных файлов вручную или переустановите программу.',
+               mbError, MB_OK)
+      else if MsgBox('Удалить также настройки и базу данных Desktop Organizer?',
+                     mbConfirmation, MB_YESNO) = IDYES then
         DelTree(DataDir, True, True, True);
+    end;
   end;
 end;

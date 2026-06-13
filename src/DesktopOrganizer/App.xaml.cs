@@ -144,7 +144,15 @@ public partial class App : Application
             try
             {
                 var hidden = Db.GetHiddenItems();
-                foreach (var it in hidden) DesktopIconService.Restore(it.FullPath, it.AddedAttributes);
+                foreach (var it in hidden)
+                {
+                    var res = DesktopIconService.Restore(it.FullPath, it.AddedAttributes);
+                    // Восстановили (или файла нет) — членство в коробке сохраняем (HiddenByApp=true),
+                    // но «применённые нами биты» обнуляем: иначе если пользователь сам скроет файл,
+                    // пока программа выключена, следующий выход снимет уже его атрибуты.
+                    if (res != RestoreResult.Failed)
+                        Db.SetItemHidden(it.Id, true, 0);
+                }
                 if (hidden.Count > 0) DesktopIconService.RefreshDesktop();
             }
             catch (Exception ex) { Logger.Error("OnExit.Restore", ex); }
