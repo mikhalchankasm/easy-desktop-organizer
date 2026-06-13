@@ -65,18 +65,19 @@ public class RecoveryPlanTests
     }
 
     [Fact]
-    public void DbReadFailed_IsMinusOne_ButStillClearsRestoredIds()
+    public void DbReadFailed_IsMinusOne_AndClearsNothing()
     {
-        // БД прочитана не полностью → не рапортуем успех (деинсталлятор не сотрёт данные),
-        // но то, что реально восстановили по журналу, всё равно помечаем — повторно не трогать.
-        var plan = new[] { Target(@"C:\a", 1) };
+        // Сбой чтения БД → не рапортуем успех (деинсталлятор не сотрёт данные) И ничего не чистим:
+        // в реальной интеграции при таком сбое план строится только из журнала, у journal-only
+        // targets ItemIds пусты. Resolve фиксирует тот же инвариант даже если ему передали id.
+        var plan = new[] { Target(@"C:\a", 1) }; // у реального journal-only target id бы не было
         var r = RecoveryPlan.Resolve(
             plan, new[] { RestoreOutcome.Restored },
             journalReadOk: true, dbReadOk: false);
 
         Assert.Equal(-1, r.Failed);
         Assert.False(r.Success);
-        Assert.Equal(new long[] { 1 }, r.ClearedIds);
+        Assert.Empty(r.ClearedIds);
     }
 
     [Fact]

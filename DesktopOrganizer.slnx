@@ -1,6 +1,7 @@
 <Solution>
   <Folder Name="/src/">
     <Project Path="src/DesktopOrganizer/DesktopOrganizer.csproj" />
+    <Project Path="src/DesktopOrganizer.Core/DesktopOrganizer.Core.csproj" />
   </Folder>
   <Folder Name="/tests/">
     <Project Path="tests/DesktopOrganizer.Tests/DesktopOrganizer.Tests.csproj" />

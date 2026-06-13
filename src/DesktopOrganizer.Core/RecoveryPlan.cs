@@ -24,9 +24,11 @@ public static class RecoveryPlan
 
     /// <summary>
     /// <paramref name="outcomes"/> идёт параллельно <paramref name="plan"/>. Флаги БД чистятся ТОЛЬКО
-    /// для target'ов с итогом Restored/FileGone. Если журнал или БД прочитаны не полностью
-    /// (<paramref name="journalReadOk"/>/<paramref name="dbReadOk"/> = false) — результат -1 (не успех),
-    /// чтобы деинсталлятор не счёл восстановление успешным и не предложил удалить данные.
+    /// для target'ов с итогом Restored/FileGone и только если БД прочитана полностью.
+    /// Если журнал или БД прочитаны не полностью (<paramref name="journalReadOk"/>/<paramref name="dbReadOk"/>
+    /// = false) — результат -1 (не успех) и список очистки пуст: при сбое чтения БД у нас нет полной
+    /// картины её строк (в план попадают только journal-only targets без ItemIds), поэтому чистить
+    /// нечего и не следует. -1 не даёт деинсталлятору счесть восстановление успешным и удалить данные.
     /// </summary>
     public static Result Resolve(
         IReadOnlyList<RestoreTarget> plan,
@@ -37,7 +39,7 @@ public static class RecoveryPlan
         if (plan.Count != outcomes.Count)
             throw new ArgumentException("outcomes должен идти параллельно plan", nameof(outcomes));
 
-        if (!journalReadOk)
+        if (!journalReadOk || !dbReadOk)
             return new Result(-1, Array.Empty<long>(), false);
 
         var failed = 0;
@@ -48,7 +50,6 @@ public static class RecoveryPlan
             cleared.AddRange(plan[i].ItemIds); // файл мог быть в нескольких коробках — чистим все строки
         }
 
-        var result = dbReadOk ? failed : -1; // не прочитали БД → union мог быть неполным → не успех
-        return new Result(result, cleared, result == 0);
+        return new Result(failed, cleared, failed == 0);
     }
 }

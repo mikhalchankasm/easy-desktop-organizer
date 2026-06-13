@@ -198,6 +198,8 @@ public partial class App : Application
             var failed = RestoreAllHidden(Db, keepMembership: true);
             if (failed > 0)
                 Logger.Log($"OnExit: {failed} файлов не возвращены (останутся в журнале до следующего запуска)");
+            else if (failed < 0)
+                Logger.Log("OnExit: журнал или БД не прочитаны — восстановление отложено до следующего запуска (fail-closed)");
         }
         catch (Exception ex) { Logger.Error("OnExit.Restore", ex); }
 
