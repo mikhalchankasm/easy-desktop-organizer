@@ -7,6 +7,9 @@
     <Nullable>enable</Nullable>
     <ImplicitUsings>enable</ImplicitUsings>
     <IsPackable>false</IsPackable>
+    <!-- Анализаторы включены, но предупреждения как ошибки — НЕТ: тестовые методы и помощники
+         нередко намеренно нарушают правила стиля (CA1707 — подчёркивания в именованиях тестов). -->
+    <AnalysisLevel>latest</AnalysisLevel>
   </PropertyGroup>
 
   <ItemGroup>

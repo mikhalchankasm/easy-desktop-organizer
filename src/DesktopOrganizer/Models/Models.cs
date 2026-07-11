@@ -13,8 +13,6 @@ public class Box
     public double Opacity { get; set; } = 1.0;
     public bool IsLocked { get; set; }
     public bool IsCollapsed { get; set; }
-    public bool IsHidden { get; set; }
-    public int SortOrder { get; set; }
 
     /// <summary>Размер значков элементов в DIP: 24 (мелкие), 32 (обычные), 48 (крупные).</summary>
     public int IconSize { get; set; } = 32;

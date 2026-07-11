@@ -1,3 +1,4 @@
+using System.IO;
 using System.Text;
 using System.Windows;
 using System.Windows.Input;
@@ -60,7 +61,27 @@ public partial class App : Application
         AppDomain.CurrentDomain.UnhandledException += (_, args) =>
             Logger.Error("AppDomain", (args.ExceptionObject as Exception) ?? new Exception("unknown"));
 
-        Db = new Db();
+        // Открытие/миграция БД — вне try/catch роняло приложение без диагностики при повреждённом
+        // app.db. Показываем понятное сообщение, пытаемся вернуть скрытые ярлыки по журналу
+        // (он не зависит от SQLite) и закрываемся — иначе скрытые файлы останутся скрытыми,
+        // а успешного запуска для recovery может так и не наступить.
+        try
+        {
+            Db = new Db();
+        }
+        catch (Exception ex)
+        {
+            Logger.Error("OnStartup.Db", ex);
+            MessageBox.Show(
+                "Не удалось открыть базу данных Desktop Organizer.\n" +
+                $"Файл может быть повреждён:\n{Path.Combine(Db.AppDataDir, "app.db")}\n\n" +
+                "Приложение попытается вернуть скрытые ярлыки на рабочий стол по журналу и закроется.",
+                "Desktop Organizer", MessageBoxButton.OK, MessageBoxImage.Error);
+            try { RestoreAllHidden(null, keepMembership: true); }
+            catch (Exception ex2) { Logger.Error("OnStartup.RestoreFallback", ex2); }
+            Shutdown(1);
+            return;
+        }
         RehideOnStartup();
 
         LoadAndShowBoxes();
@@ -257,7 +278,7 @@ public partial class App : Application
     {
         var w = new BoxWindow(box);
         _boxWindows[box.Id] = w;
-        if (!box.IsHidden && !_boxesHidden) w.Show();
+        if (!_boxesHidden) w.Show();
         return w;
     }
 
@@ -335,7 +356,7 @@ public partial class App : Application
         foreach (var w in _boxWindows.Values)
         {
             if (_boxesHidden) w.Hide();
-            else if (!w.Box.IsHidden) w.Show();
+            else w.Show();
         }
         Logger.Log(_boxesHidden ? "Коробки скрыты" : "Коробки показаны");
     }
@@ -559,10 +580,34 @@ public partial class App : Application
     private void InitHotkeys()
     {
         _hotkeys = new HotkeyManager();
+        // Перезапуск Explorer уничтожает owned-окна-коробки вместе с владельцем (Progman/WorkerW).
+        // TaskbarCreated — широковещательная рассылка после рестарта шелла: перепривязываем владельца.
+        _hotkeys.TaskbarCreated += OnExplorerRestarted;
         var ok1 = _hotkeys.Register(ModifierKeys.Control | ModifierKeys.Alt, Key.D, ToggleBoxesVisibility);
         var ok2 = _hotkeys.Register(ModifierKeys.Control, Key.Space, ShowSearch);
         var ok3 = _hotkeys.Register(ModifierKeys.Control | ModifierKeys.Alt, Key.N, CreateNewBoxInteractive);
         if (!ok1 || !ok2 || !ok3)
             Logger.Log("Часть горячих клавиш не зарегистрирована (конфликт с другими приложениями)");
+    }
+
+    /// <summary>
+    /// После перезапуска Explorer окно рабочего стола (Progman/WorkerW) пересоздаётся, а коробки —
+    /// owned-окна — уничтожаются вместе со старым владельцем. Сбрасываем кэш и перепривязываем
+    /// владельца каждого открытого окна, после чего показываем коробки заново.
+    /// </summary>
+    private void OnExplorerRestarted()
+    {
+        Logger.Log("Explorer перезапущен — перепривязываем владельцев коробок");
+        DesktopHost.InvalidateCache();
+        foreach (var w in _boxWindows.Values)
+        {
+            try
+            {
+                if (w.Hwnd != IntPtr.Zero) DesktopHost.SetDesktopAsOwner(w.Hwnd);
+                // Окно могло быть закрыто шеллом — показываем, если режим «чистый стол» не активен.
+                if (!_boxesHidden && !w.IsVisible) w.Show();
+            }
+            catch (Exception ex) { Logger.Error("OnExplorerRestarted", ex); }
+        }
     }
 }

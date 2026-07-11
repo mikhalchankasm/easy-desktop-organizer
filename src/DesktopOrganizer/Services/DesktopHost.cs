@@ -36,6 +36,13 @@ public static class DesktopHost
     private static IntPtr _host;
 
     /// <summary>
+    /// Сбрасывает кэш окна рабочего стола. Вызывается при перезапуске Explorer (широковещательное
+    /// сообщение TaskbarCreated): Progman/WorkerW уничтожаются и создаются заново, старый HWND
+    /// больше не валиден — без сброса FindDesktopHost вернёт устаревший кэш.
+    /// </summary>
+    public static void InvalidateCache() => _host = IntPtr.Zero;
+
+    /// <summary>
     /// Окно, содержащее SHELLDLL_DefView (иконки рабочего стола):
     /// классически Progman, на новых сборках Windows 11 — один из WorkerW.
     /// Кэш сбрасывается, если окно стало невалидным (например, перезапуск Explorer).

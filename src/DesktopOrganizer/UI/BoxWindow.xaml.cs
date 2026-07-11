@@ -469,6 +469,7 @@ public partial class BoxWindow : Window
         else
         {
             ItemsList.Visibility = Visibility.Visible;
+            MinHeight = 40; // вернуть исходный минимум из XAML (сворачивание ставило 34)
             Height = Math.Max(_expandedHeight, 80);
         }
         if (save) App.Db.UpdateBox(Box);
@@ -656,14 +657,16 @@ public partial class BoxWindow : Window
         }
     }
 
-    /// <summary>Записывает текущий порядок элементов коллекции в DisplayOrder.</summary>
+    /// <summary>Записывает текущий порядок элементов коллекции в DisplayOrder (атомарно, одной транзакцией).</summary>
     private void PersistOrder()
     {
+        var orders = new List<(long Id, int Order)>(Items.Count);
         for (var i = 0; i < Items.Count; i++)
         {
             Items[i].DisplayOrder = i;
-            App.Db.UpdateItemOrder(Items[i].Id, i);
+            orders.Add((Items[i].Id, i));
         }
+        App.Db.UpdateItemOrders(orders);
     }
 
     private void ItemsList_PreviewMouseLeftButtonDown(object sender, MouseButtonEventArgs e) =>
@@ -927,11 +930,13 @@ public partial class BoxWindow : Window
     private void SortByName()
     {
         var sorted = Items.OrderBy(i => i.Name, StringComparer.CurrentCultureIgnoreCase).ToList();
+        var orders = new List<(long Id, int Order)>(sorted.Count);
         for (var i = 0; i < sorted.Count; i++)
         {
             sorted[i].DisplayOrder = i;
-            App.Db.UpdateItemOrder(sorted[i].Id, i);
+            orders.Add((sorted[i].Id, i));
         }
+        App.Db.UpdateItemOrders(orders);
         Items.Clear();
         foreach (var it in sorted) Items.Add(it);
     }

@@ -6,6 +6,10 @@
     <TargetFramework>net8.0</TargetFramework>
     <Nullable>enable</Nullable>
     <ImplicitUsings>enable</ImplicitUsings>
+    <!-- Включаем анализаторы Roslyn и трактуем предупреждения как ошибки: чистое ядро
+         логики восстановления не должно регрессировать (CI на каждой сборке/PR). -->
+    <AnalysisLevel>latest</AnalysisLevel>
+    <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
   </PropertyGroup>
 
 </Project>

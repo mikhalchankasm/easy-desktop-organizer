@@ -4,167 +4,41 @@ using DesktopOrganizer.Data;
 namespace DesktopOrganizer.Services;
 
 /// <summary>
-/// Durable-журнал скрытых приложением файлов: полный путь → добавленные биты атрибутов.
+/// Durable-журнал скрытых приложением файлов — тонкая обёртка над <see cref="JournalStore"/>
+/// (файловый движок в Core, тестируется отдельно), фиксирующая конкретные пути и имя mutex.
 /// Запись делается ДО изменения атрибутов файла и удаляется ПОСЛЕ его возврата на стол.
 /// Источник правды для восстановления, НЕ зависящий от SQLite.
 ///
-/// Гарантии:
-/// - Мутации (Record/Remove) держат МЕЖПРОЦЕССНЫЙ mutex и читают файл заново. Если mutex не
-///   получен или файл не прочитан надёжно — операция ОТМЕНЯЕТСЯ (возвращает false), журнал
-///   не перезаписывается пустым/частичным снимком и существующие записи не теряются.
-/// - Чтения (Lookup/TryGetAll) делаются без блокировки: запись атомарна (.tmp → replace),
-///   поэтому читатель видит либо старый, либо новый цельный файл.
-/// - Запись: FileStream + Flush(true) + атомарная замена. На NTFS переименование журналируется,
-///   что сводит к минимуму потерю при сбое питания (абсолютной гарантии flush директории нет).
+/// Mutex — Global\: журнал (файл в %LOCALAPPDATA%) один на пользователя во ВСЕХ его сессиях
+/// (консоль + RDP), и запись с взаимным исключением должна защищать именно его. Имя mutex
+/// содержит Environment.UserName, так что Global\ + UserName = «один файл на пользователя».
+/// (Единственный экземпляр приложения, напротив, остаётся Local\ — в разных RDP-сессиях одного
+/// пользователя отдельные экземпляры приложения допустимы, гонки за окнами между ними нет.)
 ///
 /// Файл: %LOCALAPPDATA%\DesktopOrganizer\hide-journal.txt, строки "&lt;битыInt&gt;\t&lt;путь&gt;".
 /// </summary>
-/// <summary>Результат точечного поиска в журнале (различаем «не прочитан» и «нет записи»).</summary>
-public enum JournalLookup { Found, NotFound, ReadFailed }
-
 public static class HideJournal
 {
     private static string FilePath => Path.Combine(Db.AppDataDir, "hide-journal.txt");
-    private static string MutexName => $"Local\\DesktopOrganizer_Journal_{Environment.UserName}";
+    private static string MutexName => $"Global\\DesktopOrganizer_Journal_{Environment.UserName}";
 
-    /// <summary>Читает все строки с разделяемым доступом (не мешает параллельной атомарной замене).</summary>
-    private static List<string> ReadAllLinesShared(string path)
-    {
-        using var fs = new FileStream(path, FileMode.Open, FileAccess.Read,
-            FileShare.ReadWrite | FileShare.Delete);
-        using var sr = new StreamReader(fs);
-        var lines = new List<string>();
-        string? line;
-        while ((line = sr.ReadLine()) != null) lines.Add(line);
-        return lines;
-    }
-
-    /// <summary>
-    /// Читает журнал. false — чтение НЕ удалось (нельзя перезаписывать journal — потеряем записи!).
-    /// Fail-closed: непустая строка некорректного формата трактуется как сбой, а не молча отбрасывается.
-    /// </summary>
-    private static bool TryLoad(out Dictionary<string, FileAttributes> map)
-    {
-        map = new Dictionary<string, FileAttributes>(StringComparer.OrdinalIgnoreCase);
-        try
-        {
-            if (!File.Exists(FilePath)) return true; // пустой журнал — валидное состояние
-            foreach (var line in ReadAllLinesShared(FilePath))
-            {
-                if (line.Length == 0) continue; // пустые строки игнорируем
-                // Разбор и fail-closed-валидация — общий контракт с записью (JournalFormat в Core).
-                if (!JournalFormat.TryParseLine(line, out var path, out var bits))
-                {
-                    Logger.Log($"HideJournal: некорректная строка, чтение прервано (fail-closed): {line}");
-                    map = new Dictionary<string, FileAttributes>(StringComparer.OrdinalIgnoreCase);
-                    return false;
-                }
-                map[path] = bits;
-            }
-            return true;
-        }
-        catch (Exception ex)
-        {
-            Logger.Error("HideJournal.Load", ex);
-            return false;
-        }
-    }
-
-    /// <summary>Запись на диск с fsync и атомарной заменой. true — только при успехе.</summary>
-    private static bool SaveDurable(Dictionary<string, FileAttributes> map)
-    {
-        try
-        {
-            Directory.CreateDirectory(Db.AppDataDir);
-            var tmp = FilePath + ".tmp";
-            using (var fs = new FileStream(tmp, FileMode.Create, FileAccess.Write, FileShare.None))
-            using (var sw = new StreamWriter(fs))
-            {
-                foreach (var kv in map) { sw.Write(JournalFormat.FormatLine(kv.Key, kv.Value)); sw.Write('\n'); }
-                sw.Flush();
-                fs.Flush(flushToDisk: true); // буферы ОС → физический диск
-            }
-            if (File.Exists(FilePath)) File.Replace(tmp, FilePath, null);
-            else File.Move(tmp, FilePath);
-            return true;
-        }
-        catch (Exception ex)
-        {
-            Logger.Error("HideJournal.Save", ex);
-            return false;
-        }
-    }
-
-    /// <summary>
-    /// Атомарная мутация под межпроцессным mutex. change возвращает, нужно ли сохранять.
-    /// Любой сбой (mutex/чтение/запись) → false, и журнал НЕ перезаписывается «вслепую».
-    /// </summary>
-    private static bool Mutate(Func<Dictionary<string, FileAttributes>, bool> change)
-    {
-        using var mtx = new Mutex(false, MutexName);
-        var acquired = false;
-        try
-        {
-            try { acquired = mtx.WaitOne(TimeSpan.FromSeconds(10)); }
-            catch (AbandonedMutexException) { acquired = true; } // прежний владелец упал — продолжаем
-            if (!acquired)
-            {
-                Logger.Log("HideJournal: не удалось получить mutex — операция отменена");
-                return false;
-            }
-            if (!TryLoad(out var map))
-            {
-                Logger.Log("HideJournal: журнал не прочитан — мутация отменена (не теряем записи)");
-                return false;
-            }
-            if (!change(map)) return true; // изменений нет — успех без записи
-            return SaveDurable(map);
-        }
-        finally
-        {
-            if (acquired) mtx.ReleaseMutex();
-        }
-    }
+    private static JournalStore Store => new(FilePath, MutexName, Logger.Log);
 
     /// <summary>
     /// Фиксирует запись. true — ТОЛЬКО при подтверждённой записи; вызывать ДО SetAttributes.
-    /// Строго fail-closed (тот же контракт, что и <see cref="TryLoad"/>): принимаются ТОЛЬКО
-    /// ненулевое подмножество <see cref="DesktopIconService.HideMask"/> без посторонних бит. Лишние
-    /// биты НЕ маскируются молча, а отклоняются — иначе повреждённый источник (например, seed из БД
-    /// с битым AddedAttributes) закрепился бы как «валидная» recovery-запись и скрыл повреждение.
-    /// Маскирование как защита остаётся на стороне Restore/RestorePlanner.
+    /// Строго fail-closed: принимаются ТОЛЬКО ненулевое подмножество
+    /// <see cref="DesktopIconService.HideMask"/> без посторонних бит. См. <see cref="JournalStore.Record"/>.
     /// </summary>
-    public static bool Record(string path, FileAttributes added)
-    {
-        if (string.IsNullOrEmpty(path) || !HideAttributes.IsValidAddedBits(added))
-        {
-            Logger.Log($"HideJournal.Record: недопустимые биты ({added}) или пустой путь — запись отклонена (fail-closed): {path}");
-            return false;
-        }
-        return Mutate(map => { map[path] = added; return true; });
-    }
+    public static bool Record(string path, FileAttributes added) => Store.Record(path, added);
 
     /// <summary>Удаляет запись. true — удаление зафиксировано (или записи не было).</summary>
-    public static bool Remove(string path) =>
-        Mutate(map => map.Remove(path));
+    public static bool Remove(string path) => Store.Remove(path);
 
     /// <summary>Tri-state поиск: Found(+биты) / NotFound / ReadFailed. Не путать «нет» и «не прочитан».</summary>
-    public static JournalLookup Lookup(string path, out FileAttributes added)
-    {
-        added = 0;
-        if (!TryLoad(out var map)) return JournalLookup.ReadFailed;
-        return map.TryGetValue(path, out added) ? JournalLookup.Found : JournalLookup.NotFound;
-    }
+    public static JournalLookup Lookup(string path, out FileAttributes added) =>
+        Store.Lookup(path, out added);
 
     /// <summary>Все записи. false — журнал не прочитан (НЕ трактовать как «пусто»).</summary>
-    public static bool TryGetAll(out IReadOnlyList<KeyValuePair<string, FileAttributes>> entries)
-    {
-        if (TryLoad(out var map))
-        {
-            entries = map.ToList();
-            return true;
-        }
-        entries = new List<KeyValuePair<string, FileAttributes>>();
-        return false;
-    }
+    public static bool TryGetAll(out IReadOnlyList<KeyValuePair<string, FileAttributes>> entries) =>
+        Store.TryGetAll(out entries);
 }

@@ -15,14 +15,28 @@ public sealed class HotkeyManager : IDisposable
     [DllImport("user32.dll")]
     private static extern bool UnregisterHotKey(IntPtr hWnd, int id);
 
+    [DllImport("user32.dll", CharSet = CharSet.Unicode)]
+    private static extern uint RegisterWindowMessage(string lpString);
+
     private const int WM_HOTKEY = 0x0312;
 
     private readonly HwndSource _source;
     private readonly Dictionary<int, Action> _actions = new();
     private int _nextId = 1;
 
+    // Explorer рассылает это сообщение всем top-level окнам при своём перезапуске (TaskbarCreated).
+    // Регистрируем через RegisterWindowMessage: числовой идентификатор не фиксирован в Win32.
+    private readonly uint _taskbarCreatedMsg;
+
+    /// <summary>
+    /// Вызывается, когда Explorer перезапустился (TaskbarCreated) — окна-коробки, владельцем
+    /// которых был Progman/WorkerW, уничтожаются вместе с ним и нуждаются в перепривязке владельца.
+    /// </summary>
+    public event Action? TaskbarCreated;
+
     public HotkeyManager()
     {
+        _taskbarCreatedMsg = RegisterWindowMessage("TaskbarCreated");
         var p = new HwndSourceParameters("DesktopOrganizerHotkeyWindow")
         {
             Width = 0,
@@ -55,7 +69,15 @@ public sealed class HotkeyManager : IDisposable
 
     private IntPtr WndProc(IntPtr hwnd, int msg, IntPtr wParam, IntPtr lParam, ref bool handled)
     {
-        if (msg == WM_HOTKEY && _actions.TryGetValue(wParam.ToInt32(), out var action))
+        // TaskbarCreated: RegisterWindowMessage возвращает динамический идентификатор (если он
+        // ненулевой — регистрация удалась). При совпадении оповещаем подписчиков о рестарте Explorer.
+        if (_taskbarCreatedMsg != 0 && msg == _taskbarCreatedMsg)
+        {
+            try { TaskbarCreated?.Invoke(); }
+            catch (Exception ex) { Logger.Error("TaskbarCreated", ex); }
+            handled = true;
+        }
+        else if (msg == WM_HOTKEY && _actions.TryGetValue(wParam.ToInt32(), out var action))
         {
             try { action(); }
             catch (Exception ex) { Logger.Error("Hotkey", ex); }

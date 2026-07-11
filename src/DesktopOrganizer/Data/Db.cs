@@ -39,8 +39,6 @@ public sealed class Db : IDisposable
                 Opacity REAL NOT NULL DEFAULT 1.0,
                 IsLocked INTEGER NOT NULL DEFAULT 0,
                 IsCollapsed INTEGER NOT NULL DEFAULT 0,
-                IsHidden INTEGER NOT NULL DEFAULT 0,
-                SortOrder INTEGER NOT NULL DEFAULT 0,
                 CreatedAt TEXT, UpdatedAt TEXT);
 
             CREATE TABLE IF NOT EXISTS Items(
@@ -56,11 +54,6 @@ public sealed class Db : IDisposable
 
             CREATE INDEX IF NOT EXISTS IX_Items_BoxId ON Items(BoxId);
             CREATE INDEX IF NOT EXISTS IX_Items_FullPath ON Items(FullPath);
-
-            CREATE TABLE IF NOT EXISTS Settings(
-                Key TEXT PRIMARY KEY,
-                Value TEXT,
-                UpdatedAt TEXT);
             """);
         Exec("PRAGMA foreign_keys = ON;");
         Exec("PRAGMA journal_mode = WAL;");   // устойчивее к сбоям
@@ -90,6 +83,7 @@ public sealed class Db : IDisposable
         lock (_lock)
         {
             using var cmd = _conn.CreateCommand();
+            cmd.Transaction = _tx; // единообразно с остальными командами (см. UpdateItemOrders)
             cmd.CommandText = $"PRAGMA table_info({table})";
             using var r = cmd.ExecuteReader();
             while (r.Read())
@@ -144,7 +138,8 @@ public sealed class Db : IDisposable
         lock (_lock)
         {
             using var cmd = _conn.CreateCommand();
-            cmd.CommandText = "SELECT Id,Name,X,Y,Width,Height,BackgroundColor,Opacity,IsLocked,IsCollapsed,IsHidden,SortOrder,IconSize FROM Boxes ORDER BY SortOrder, Id";
+            cmd.Transaction = _tx;
+            cmd.CommandText = "SELECT Id,Name,X,Y,Width,Height,BackgroundColor,Opacity,IsLocked,IsCollapsed,IconSize FROM Boxes ORDER BY Id";
             using var r = cmd.ExecuteReader();
             while (r.Read())
             {
@@ -155,8 +150,7 @@ public sealed class Db : IDisposable
                     Width = r.GetDouble(4), Height = r.GetDouble(5),
                     BackgroundColor = r.GetString(6), Opacity = r.GetDouble(7),
                     IsLocked = r.GetInt64(8) != 0, IsCollapsed = r.GetInt64(9) != 0,
-                    IsHidden = r.GetInt64(10) != 0, SortOrder = (int)r.GetInt64(11),
-                    IconSize = (int)r.GetInt64(12),
+                    IconSize = (int)r.GetInt64(10),
                 });
             }
         }
@@ -168,9 +162,10 @@ public sealed class Db : IDisposable
         lock (_lock)
         {
             using var cmd = _conn.CreateCommand();
+            cmd.Transaction = _tx;
             cmd.CommandText = """
-                INSERT INTO Boxes(Name,X,Y,Width,Height,BackgroundColor,Opacity,IsLocked,IsCollapsed,IsHidden,SortOrder,CreatedAt,UpdatedAt)
-                VALUES(@n,@x,@y,@w,@h,@bg,@op,@lk,@cl,@hd,@so,@t,@t);
+                INSERT INTO Boxes(Name,X,Y,Width,Height,BackgroundColor,Opacity,IsLocked,IsCollapsed,CreatedAt,UpdatedAt)
+                VALUES(@n,@x,@y,@w,@h,@bg,@op,@lk,@cl,@t,@t);
                 SELECT last_insert_rowid();
                 """;
             cmd.Parameters.AddWithValue("@n", b.Name);
@@ -182,8 +177,6 @@ public sealed class Db : IDisposable
             cmd.Parameters.AddWithValue("@op", b.Opacity);
             cmd.Parameters.AddWithValue("@lk", b.IsLocked ? 1 : 0);
             cmd.Parameters.AddWithValue("@cl", b.IsCollapsed ? 1 : 0);
-            cmd.Parameters.AddWithValue("@hd", b.IsHidden ? 1 : 0);
-            cmd.Parameters.AddWithValue("@so", b.SortOrder);
             cmd.Parameters.AddWithValue("@t", Now());
             b.Id = (long)cmd.ExecuteScalar()!;
             return b.Id;
@@ -192,12 +185,12 @@ public sealed class Db : IDisposable
 
     public void UpdateBox(Box b) => Exec("""
         UPDATE Boxes SET Name=@n, X=@x, Y=@y, Width=@w, Height=@h, BackgroundColor=@bg, Opacity=@op,
-            IsLocked=@lk, IsCollapsed=@cl, IsHidden=@hd, SortOrder=@so, IconSize=@ic, UpdatedAt=@t WHERE Id=@id
+            IsLocked=@lk, IsCollapsed=@cl, IconSize=@ic, UpdatedAt=@t WHERE Id=@id
         """,
         ("@n", b.Name), ("@x", b.X), ("@y", b.Y), ("@w", b.Width), ("@h", b.Height),
         ("@bg", b.BackgroundColor), ("@op", b.Opacity),
-        ("@lk", b.IsLocked ? 1 : 0), ("@cl", b.IsCollapsed ? 1 : 0), ("@hd", b.IsHidden ? 1 : 0),
-        ("@so", b.SortOrder), ("@ic", b.IconSize), ("@t", Now()), ("@id", b.Id));
+        ("@lk", b.IsLocked ? 1 : 0), ("@cl", b.IsCollapsed ? 1 : 0),
+        ("@ic", b.IconSize), ("@t", Now()), ("@id", b.Id));
 
     public void DeleteBox(long boxId) => RunInTransaction(() =>
     {
@@ -213,6 +206,7 @@ public sealed class Db : IDisposable
         lock (_lock)
         {
             using var cmd = _conn.CreateCommand();
+            cmd.Transaction = _tx;
             cmd.CommandText = "SELECT Id,BoxId,Name,FullPath,ItemType,Extension,DisplayOrder,IsMissing,HiddenByApp,AddedAttributes FROM Items WHERE BoxId=@b ORDER BY DisplayOrder, Id";
             cmd.Parameters.AddWithValue("@b", boxId);
             using var r = cmd.ExecuteReader();
@@ -274,6 +268,22 @@ public sealed class Db : IDisposable
     public void UpdateItemOrder(long itemId, int order) =>
         Exec("UPDATE Items SET DisplayOrder=@o, UpdatedAt=@t WHERE Id=@id", ("@o", order), ("@t", Now()), ("@id", itemId));
 
+    /// <summary>
+    /// Атомарно переписывает порядок группы элементов в одной транзакции (всё или ничего),
+    /// вместо N независимых UPDATE/коммитов. Для PersistOrder/SortByName — один WAL-чекпойнт
+    /// вместо десятков.
+    /// </summary>
+    public void UpdateItemOrders(IReadOnlyList<(long Id, int Order)> orders)
+    {
+        if (orders.Count == 0) return;
+        RunInTransaction(() =>
+        {
+            foreach (var (id, order) in orders)
+                Exec("UPDATE Items SET DisplayOrder=@o, UpdatedAt=@t WHERE Id=@id",
+                    ("@o", order), ("@t", Now()), ("@id", id));
+        });
+    }
+
     public void SetItemMissing(long itemId, bool missing) =>
         Exec("UPDATE Items SET IsMissing=@m WHERE Id=@id", ("@m", missing ? 1 : 0), ("@id", itemId));
 
@@ -284,6 +294,7 @@ public sealed class Db : IDisposable
         lock (_lock)
         {
             using var cmd = _conn.CreateCommand();
+            cmd.Transaction = _tx;
             cmd.CommandText = "SELECT Id,BoxId,FullPath,AddedAttributes FROM Items WHERE HiddenByApp=1";
             using var r = cmd.ExecuteReader();
             while (r.Read())
@@ -306,6 +317,7 @@ public sealed class Db : IDisposable
         lock (_lock)
         {
             using var cmd = _conn.CreateCommand();
+            cmd.Transaction = _tx;
             cmd.CommandText = "SELECT FullPath FROM Items";
             using var r = cmd.ExecuteReader();
             while (r.Read()) set.Add(r.GetString(0));
@@ -322,6 +334,7 @@ public sealed class Db : IDisposable
         lock (_lock)
         {
             using var cmd = _conn.CreateCommand();
+            cmd.Transaction = _tx;
             cmd.CommandText = """
                 SELECT i.Id, i.BoxId, i.Name, i.FullPath, i.ItemType, b.Name
                 FROM Items i JOIN Boxes b ON b.Id = i.BoxId
@@ -342,23 +355,6 @@ public sealed class Db : IDisposable
         }
         return list;
     }
-
-    // ---------- Settings ----------
-
-    public string? GetSetting(string key)
-    {
-        lock (_lock)
-        {
-            using var cmd = _conn.CreateCommand();
-            cmd.CommandText = "SELECT Value FROM Settings WHERE Key=@k";
-            cmd.Parameters.AddWithValue("@k", key);
-            return cmd.ExecuteScalar() as string;
-        }
-    }
-
-    public void SetSetting(string key, string value) => Exec(
-        "INSERT INTO Settings(Key,Value,UpdatedAt) VALUES(@k,@v,@t) ON CONFLICT(Key) DO UPDATE SET Value=@v, UpdatedAt=@t",
-        ("@k", key), ("@v", value), ("@t", Now()));
 
     public void Dispose() => _conn.Dispose();
 }

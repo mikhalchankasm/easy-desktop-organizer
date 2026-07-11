@@ -3,6 +3,7 @@ using System.Diagnostics;
 using System.IO;
 using System.Runtime.InteropServices;
 using System.Text;
+using DesktopOrganizer.Data;
 using DesktopOrganizer.Models;
 
 namespace DesktopOrganizer.Services;
@@ -263,30 +264,35 @@ public static class DesktopIconService
     }
 
     /// <summary>
-    /// Удаляет переданные пути с повышением прав. Список и скрипт пишутся во временные файлы,
-    /// удаление идёт через PowerShell -LiteralPath (без склейки/экранирования в командной строке —
-    /// безопасно даже если путь профиля содержит апостроф).
+    /// Удаляет переданные пути с повышением прав. Список путей пишется в каталог приложения
+    /// (%LOCALAPPDATA%\DesktopOrganizer — НЕ world-writable %TEMP%, туда не пишут другие процессы
+    /// пользователя), а сам сценарий PowerShell передаётся как base64 через -EncodedCommand —
+    /// на диске нет .ps1, который вредоносный процесс с правами пользователя мог бы подменить
+    /// в окне между записью и запуском элевированного процесса (TOCTOU). Удаление идёт через
+    /// -LiteralPath (без склейки/экранирования в командной строке — безопасно даже если путь
+    /// профиля содержит апостроф).
     /// </summary>
     public static DeleteElevatedResult DeleteElevated(IEnumerable<string> paths)
     {
         var list = paths.ToList();
         if (list.Count == 0) return DeleteElevatedResult.Completed;
 
-        var listFile = Path.Combine(Path.GetTempPath(), $"ied_del_{Guid.NewGuid():N}.txt");
-        var scriptFile = Path.Combine(Path.GetTempPath(), $"ied_del_{Guid.NewGuid():N}.ps1");
+        Directory.CreateDirectory(Db.AppDataDir);
+        var listFile = Path.Combine(Db.AppDataDir, $"ied_del_{Guid.NewGuid():N}.txt");
         var result = DeleteElevatedResult.Error;
         try
         {
             File.WriteAllLines(listFile, list, new UTF8Encoding(false));
-            // Путь к списку встраиваем в .ps1 как литерал с экранированием апострофа ('→'').
+            // Путь к списку встраиваем в скрипт как литерал с экранированием апострофа ('→'').
             var listLiteral = listFile.Replace("'", "''");
-            File.WriteAllText(scriptFile,
+            // Скрипт передаётся как base64 прямо в аргументах — на диске нет .ps1 для подмены.
+            var script =
                 $"Get-Content -LiteralPath '{listLiteral}' -Encoding UTF8 | " +
-                "ForEach-Object { if ($_) { Remove-Item -LiteralPath $_ -Force -ErrorAction SilentlyContinue } }",
-                new UTF8Encoding(false));
+                "ForEach-Object { if ($_) { Remove-Item -LiteralPath $_ -Force -ErrorAction SilentlyContinue } }";
+            var encoded = Convert.ToBase64String(Encoding.Unicode.GetBytes(script));
 
             var psi = new ProcessStartInfo("powershell.exe",
-                $"-NoProfile -NonInteractive -ExecutionPolicy Bypass -WindowStyle Hidden -File \"{scriptFile}\"")
+                $"-NoProfile -NonInteractive -WindowStyle Hidden -EncodedCommand {encoded}")
             {
                 Verb = "runas",
                 UseShellExecute = true,
@@ -313,11 +319,11 @@ public static class DesktopIconService
         }
         finally
         {
-            // На таймауте процесс может ещё читать файлы — временные файлы не трогаем.
+            // На таймауте процесс может ещё читать список — временный файл не трогаем.
+            // .ps1 больше нет (команда передаётся через -EncodedCommand), чистим только список.
             if (result != DeleteElevatedResult.TimedOut)
             {
                 TryDelete(listFile);
-                TryDelete(scriptFile);
             }
         }
     }

@@ -1,0 +1,49 @@
+name: build
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  # Чистое ядро логики восстановления + тесты — кросс-платформенные (net8.0, без WPF/Win32).
+  # Гоняем на Ubuntu и Windows: ловим платформоспецифичные огрехи (регистр путей, кодировки).
+  test:
+    name: test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '8.0.x'
+      - name: Restore (Core + Tests)
+        run: dotnet restore tests/DesktopOrganizer.Tests/DesktopOrganizer.Tests.csproj
+      - name: Build (Core + Tests)
+        # --no-restore: восстановили выше. TreatWarningsAsErrors в Core включён — упадёт на регрессии.
+        run: dotnet build tests/DesktopOrganizer.Tests/DesktopOrganizer.Tests.csproj --configuration Release --no-restore
+      - name: Test
+        run: dotnet test tests/DesktopOrganizer.Tests/DesktopOrganizer.Tests.csproj --configuration Release --no-build --logger "normal"
+
+  # Само WPF-приложение — только Windows (net8.0-windows, UseWPF, WinForms). 0 warnings — критерий приёмки.
+  build-app:
+    name: build app (windows)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '8.0.x'
+      - name: Restore (App)
+        run: dotnet restore src/DesktopOrganizer/DesktopOrganizer.csproj
+      - name: Build (App)
+        run: dotnet build src/DesktopOrganizer/DesktopOrganizer.csproj --configuration Release --no-restore
